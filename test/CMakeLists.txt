@@ -13,6 +13,7 @@ add_executable(${TARGET}
     LatencyLookAheadTest.cpp
     CancelVsFillTest.cpp
     DeterminismTest.cpp
+    RiskEngineTest.cpp
     ResultsTest.cpp
     RuntimeTest.cpp
     TestMain.cpp

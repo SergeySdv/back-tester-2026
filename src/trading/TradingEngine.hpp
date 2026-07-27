@@ -4,6 +4,7 @@
 #include "market/HistoricalLOBStore.hpp"
 #include "scheduler/SchedulerRuntime.hpp"
 #include "trading/PositionKeeper.hpp"
+#include "trading/RiskEngine.hpp"
 #include "trading/SimulatedLOB.hpp"
 #include "trading/Strategy.hpp"
 
@@ -92,6 +93,7 @@ private:
   Strategy &strategy_;
   Recorder &recorder_;
   PositionKeeper positions_;
+  RiskEngine risk_;
   SimulatedLOB simulated_lob_;
   std::unordered_map<InstrumentId, InstrumentMeta> instruments_;
   std::unordered_map<ClOrdId, OwnOrder> orders_;

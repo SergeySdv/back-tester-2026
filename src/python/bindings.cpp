@@ -283,22 +283,46 @@ PYBIND11_MODULE(_backtester, module) {
       .value("UNSUPPORTED_TIME_IN_FORCE",
              cmf::RejectReason::UnsupportedTimeInForce)
       .value("UNKNOWN_ORDER", cmf::RejectReason::UnknownOrder)
-      .value("ALREADY_TERMINAL", cmf::RejectReason::AlreadyTerminal);
+      .value("ALREADY_TERMINAL", cmf::RejectReason::AlreadyTerminal)
+      .value("ORDER_QUANTITY_LIMIT_EXCEEDED",
+             cmf::RejectReason::OrderQuantityLimitExceeded)
+      .value("TOO_MANY_OPEN_ORDERS", cmf::RejectReason::TooManyOpenOrders)
+      .value("POSITION_LIMIT_EXCEEDED",
+             cmf::RejectReason::PositionLimitExceeded);
+
+  py::class_<cmf::RiskLimits>(module, "RiskLimits")
+      .def(py::init([](cmf::Quantity max_order_quantity,
+                       cmf::Quantity max_position_abs,
+                       std::uint32_t max_open_orders_per_instrument) {
+             return cmf::RiskLimits{max_order_quantity, max_position_abs,
+                                    max_open_orders_per_instrument};
+           }),
+           py::arg("max_order_quantity") =
+               std::numeric_limits<cmf::Quantity>::max(),
+           py::arg("max_position_abs") =
+               std::numeric_limits<cmf::Quantity>::max(),
+           py::arg("max_open_orders_per_instrument") =
+               std::numeric_limits<std::uint32_t>::max())
+      .def_readwrite("max_order_quantity", &cmf::RiskLimits::max_order_quantity)
+      .def_readwrite("max_position_abs", &cmf::RiskLimits::max_position_abs)
+      .def_readwrite("max_open_orders_per_instrument",
+                     &cmf::RiskLimits::max_open_orders_per_instrument);
 
   py::class_<cmf::BacktestConfig>(module, "BacktestConfig")
       .def(py::init([](cmf::TimestampNs market_data_latency_ns,
                        cmf::TimestampNs order_latency_ns,
-                       std::uint32_t book_depth) {
+                       std::uint32_t book_depth, cmf::RiskLimits risk) {
              return cmf::BacktestConfig{market_data_latency_ns,
-                                        order_latency_ns, book_depth};
+                                        order_latency_ns, book_depth, risk};
            }),
            py::arg("market_data_latency_ns") = 0,
            py::arg("order_latency_ns") = cmf::runtime::default_order_latency_ns,
-           py::arg("book_depth") = 15)
+           py::arg("book_depth") = 15, py::arg("risk") = cmf::RiskLimits{})
       .def_readwrite("market_data_latency_ns",
                      &cmf::BacktestConfig::market_data_latency_ns)
       .def_readwrite("order_latency_ns", &cmf::BacktestConfig::order_latency_ns)
-      .def_readwrite("book_depth", &cmf::BacktestConfig::book_depth);
+      .def_readwrite("book_depth", &cmf::BacktestConfig::book_depth)
+      .def_readwrite("risk", &cmf::BacktestConfig::risk);
 
   py::class_<cmf::DateRange>(module, "DateRange")
       .def(py::init<cmf::TimestampNs, cmf::TimestampNs>(),
