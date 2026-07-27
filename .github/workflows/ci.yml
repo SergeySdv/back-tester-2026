@@ -10,6 +10,22 @@ jobs:
   test:
     runs-on: ubuntu-latest
 
+    # The golden order log is only a determinism claim if it holds across
+    # standard library implementations, so the suite runs on libstdc++ (g++)
+    # and libc++-capable clang++ rather than one compiler.
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler:
+          - {name: gcc, cc: gcc, cxx: g++}
+          - {name: clang, cc: clang, cxx: clang++}
+
+    name: test (${{ matrix.compiler.name }})
+
+    env:
+      CC: ${{ matrix.compiler.cc }}
+      CXX: ${{ matrix.compiler.cxx }}
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4

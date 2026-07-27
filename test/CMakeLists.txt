@@ -12,6 +12,7 @@ add_executable(${TARGET}
     TradingTest.cpp
     LatencyLookAheadTest.cpp
     CancelVsFillTest.cpp
+    DeterminismTest.cpp
     ResultsTest.cpp
     RuntimeTest.cpp
     TestMain.cpp
@@ -20,6 +21,11 @@ add_executable(${TARGET}
 target_link_libraries(${TARGET} PRIVATE
     back-tester-common
     back-tester-lib
+)
+
+# Golden fixtures live in the source tree, not next to the build output.
+target_compile_definitions(${TARGET} PRIVATE
+    BACKTESTER_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data"
 )
 
 # Register one ctest entry per TEST_CASE instead of a single opaque target, so
