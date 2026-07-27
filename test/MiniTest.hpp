@@ -22,6 +22,14 @@ public:
 void require(bool condition, const char *expression, const char *file,
              int line);
 
+// Entry point shared by every test binary.
+//
+// With no arguments every registered case runs. `--list-tests` prints one case
+// name per line and exits, which lets CMake register each case as its own
+// ctest entry after the build. Any other argument selects the single case with
+// that exact name, so `ctest -R` and a manual run agree on granularity.
+int run(int argc, char **argv);
+
 } // namespace minitest
 
 #define MINITEST_CONCAT_IMPL(left, right) left##right
