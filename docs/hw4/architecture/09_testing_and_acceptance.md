@@ -57,11 +57,24 @@ uv run python examples/mean_reversion.py
 
 Benchmarks:
 
+Benchmarks live in `bench/`, not `test/`: they are not registered with ctest
+and never fail a build on a timing threshold, because CI runners are too noisy
+for absolute latency assertions. They are still built so they cannot rot.
+Report numbers from a Release build only.
+
 ```bash
-build-release/bin/test/back-tester-scheduler-benchmark
-build-release/bin/test/back-tester-price-cross-benchmark
+build-release/bin/bench/back-tester-scheduler-benchmark
+build-release/bin/bench/back-tester-price-cross-benchmark
+build-release/bin/bench/back-tester-engine-round-trip-benchmark
 uv run python python/benchmarks/callback_overhead.py
 ```
+
+`back-tester-engine-round-trip-benchmark` runs the same event stream with the
+engine called directly and again through the two-thread `SchedulerRuntime`; the
+difference is the cost of one ready-signal round trip.
+`callback_overhead.py` reports the Python callback cost against a native
+baseline and a GIL-only measurement, so the boundary cost is attributable
+rather than merely observed.
 
 Development formatting/lint checks:
 

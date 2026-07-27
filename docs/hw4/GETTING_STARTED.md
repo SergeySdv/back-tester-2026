@@ -225,7 +225,7 @@ in the same change.
 For performance work, use the Release-only benchmarks:
 
 ```bash
-build-release/bin/test/back-tester-scheduler-benchmark
+build-release/bin/bench/back-tester-scheduler-benchmark
 uv run python python/benchmarks/callback_overhead.py
 ```
 

@@ -36,8 +36,8 @@ current evidence.
 | Minimal `backtest.run(strategy, data_path, date_range)` | Three-argument form plus optional config/instruments; omitted metadata triggers deterministic discovery | `src/python/bindings.cpp`, `src/runtime/BacktestRuntime.*` | Python runtime and end-to-end tests |
 | Synthetic matching harness | Native tests cover quote/trade crossing, full oversized fills, limit protection, pre-arrival exclusion, resting, FIFO, rejects, and isolation | `test/TradingTest.cpp`, `test/TypedSimulatedLOBTest.cpp` | `uv run ctest --test-dir build-release --output-on-failure` |
 | End-to-end Python strategy | Two-instrument example uses the production streaming runtime and returns fills/orders/PnL | `examples/mean_reversion.py`, `test/data/m5_two_instrument.jsonl` | `python/tests/test_end_to_end.py`; example command |
-| Ready-signal benchmark | Warmed dispatcher-to-consumer-to-acknowledgement measurement with 100,000 samples and latency percentiles | `test/SchedulerBenchmark.cpp` | `build-release/bin/test/back-tester-scheduler-benchmark` |
-| Exact raw-signal chronology performance | Reused trigger-buffer construction and `SimulatedLOB` replay for 8- and 64-signal groups, including initial reallocations | `test/PriceCrossBenchmark.cpp` | `build-release/bin/test/back-tester-price-cross-benchmark` |
+| Ready-signal benchmark | Warmed dispatcher-to-consumer-to-acknowledgement measurement with 100,000 samples and latency percentiles | `bench/SchedulerBench.cpp` | `build-release/bin/bench/back-tester-scheduler-benchmark` |
+| Exact raw-signal chronology performance | Reused trigger-buffer construction and `SimulatedLOB` replay for 8- and 64-signal groups, including initial reallocations | `bench/PriceCrossBench.cpp` | `build-release/bin/bench/back-tester-price-cross-benchmark` |
 | 1,000-callback benchmark | 20 warmed top-1/top-15 samples, exactly 1,000 no-op callbacks per sample | `python/benchmarks/callback_overhead.py` | `uv run python python/benchmarks/callback_overhead.py` |
 | N concurrent EngineViews bonus | Not exposed by the production runtime; independent typed `SimulatedLOB` instances maintain isolated private order state under the infinite-liquidity model | `src/trading/SimulatedLOB.*` | `test/TypedSimulatedLOBTest.cpp` |
 
@@ -80,7 +80,7 @@ uv run cmake --build build-release -j
 uv run ctest --test-dir build-release --output-on-failure
 uv run pytest -q python/tests
 uv run python examples/mean_reversion.py
-build-release/bin/test/back-tester-scheduler-benchmark
-build-release/bin/test/back-tester-price-cross-benchmark
+build-release/bin/bench/back-tester-scheduler-benchmark
+build-release/bin/bench/back-tester-price-cross-benchmark
 uv run python python/benchmarks/callback_overhead.py
 ```

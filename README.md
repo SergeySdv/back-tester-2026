@@ -109,8 +109,8 @@ uv run python examples/mean_reversion.py
 Run the required benchmarks only from that Release setup:
 
 ```bash
-build-release/bin/test/back-tester-scheduler-benchmark
-build-release/bin/test/back-tester-price-cross-benchmark
+build-release/bin/bench/back-tester-scheduler-benchmark
+build-release/bin/bench/back-tester-price-cross-benchmark
 uv run python python/benchmarks/callback_overhead.py
 ```
 

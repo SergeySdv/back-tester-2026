@@ -87,29 +87,3 @@ add_test(
         ${CMAKE_CURRENT_SOURCE_DIR}/data/invalid_subnanounit_price.jsonl
 )
 set_tests_properties(cli-invalid-subnanounit-price PROPERTIES WILL_FAIL TRUE)
-
-add_executable(back-tester-scheduler-benchmark
-    SchedulerBenchmark.cpp
-)
-
-target_link_libraries(back-tester-scheduler-benchmark PRIVATE
-    back-tester-common
-    back-tester-lib
-)
-
-target_compile_definitions(back-tester-scheduler-benchmark PRIVATE
-    BACKTESTER_BENCHMARK_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
-)
-
-add_executable(back-tester-price-cross-benchmark
-    PriceCrossBenchmark.cpp
-)
-
-target_link_libraries(back-tester-price-cross-benchmark PRIVATE
-    back-tester-common
-    back-tester-lib
-)
-
-target_compile_definitions(back-tester-price-cross-benchmark PRIVATE
-    BACKTESTER_BENCHMARK_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
-)
