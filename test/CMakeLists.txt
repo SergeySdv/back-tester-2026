@@ -20,7 +20,30 @@ target_link_libraries(${TARGET} PRIVATE
     back-tester-lib
 )
 
-add_test(NAME native-unit-tests COMMAND ${TARGET})
+# Register one ctest entry per TEST_CASE instead of a single opaque target, so
+# a failure names the case and `ctest -R <case>` can run it alone.
+set(MINITEST_CTEST_FILE ${CMAKE_CURRENT_BINARY_DIR}/${TARGET}-cases.cmake)
+
+add_custom_command(TARGET ${TARGET} POST_BUILD
+    COMMAND ${CMAKE_COMMAND}
+        -DTEST_EXECUTABLE=$<TARGET_FILE:${TARGET}>
+        -DCTEST_FILE=${MINITEST_CTEST_FILE}
+        -DTEST_PREFIX=unit.
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/DiscoverMiniTests.cmake
+    BYPRODUCTS ${MINITEST_CTEST_FILE}
+    COMMENT "Discovering MiniTest cases in ${TARGET}"
+    VERBATIM
+)
+
+# Present before the first build, so a stale configure never silently drops the
+# whole suite from ctest.
+if(NOT EXISTS ${MINITEST_CTEST_FILE})
+    file(WRITE ${MINITEST_CTEST_FILE}
+        "add_test(unit.NOT_BUILT \"${CMAKE_COMMAND}\" -E false)\n")
+endif()
+
+set_property(DIRECTORY APPEND
+    PROPERTY TEST_INCLUDE_FILES ${MINITEST_CTEST_FILE})
 
 add_test(
     NAME cli-missing-path
