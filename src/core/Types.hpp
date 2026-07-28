@@ -45,6 +45,11 @@ enum class RejectReason : std::uint8_t {
   UnsupportedTimeInForce = 8,
   UnknownOrder = 9,
   AlreadyTerminal = 10,
+  // Pre-trade risk limits. Appended, so existing numeric values and any
+  // recorded order log stay valid.
+  OrderQuantityLimitExceeded = 11,
+  TooManyOpenOrders = 12,
+  PositionLimitExceeded = 13,
 };
 
 enum class EventPriority : std::uint8_t {

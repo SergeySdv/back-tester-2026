@@ -410,7 +410,7 @@ Option B buffer cost.
 Command:
 
 ```bash
-build-release/bin/test/back-tester-price-cross-benchmark
+build-release/bin/bench/back-tester-price-cross-benchmark
 ```
 
 Observed on the Release build used for this candidate:

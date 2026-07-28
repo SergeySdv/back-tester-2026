@@ -283,22 +283,46 @@ PYBIND11_MODULE(_backtester, module) {
       .value("UNSUPPORTED_TIME_IN_FORCE",
              cmf::RejectReason::UnsupportedTimeInForce)
       .value("UNKNOWN_ORDER", cmf::RejectReason::UnknownOrder)
-      .value("ALREADY_TERMINAL", cmf::RejectReason::AlreadyTerminal);
+      .value("ALREADY_TERMINAL", cmf::RejectReason::AlreadyTerminal)
+      .value("ORDER_QUANTITY_LIMIT_EXCEEDED",
+             cmf::RejectReason::OrderQuantityLimitExceeded)
+      .value("TOO_MANY_OPEN_ORDERS", cmf::RejectReason::TooManyOpenOrders)
+      .value("POSITION_LIMIT_EXCEEDED",
+             cmf::RejectReason::PositionLimitExceeded);
+
+  py::class_<cmf::RiskLimits>(module, "RiskLimits")
+      .def(py::init([](cmf::Quantity max_order_quantity,
+                       cmf::Quantity max_position_abs,
+                       std::uint32_t max_open_orders_per_instrument) {
+             return cmf::RiskLimits{max_order_quantity, max_position_abs,
+                                    max_open_orders_per_instrument};
+           }),
+           py::arg("max_order_quantity") =
+               std::numeric_limits<cmf::Quantity>::max(),
+           py::arg("max_position_abs") =
+               std::numeric_limits<cmf::Quantity>::max(),
+           py::arg("max_open_orders_per_instrument") =
+               std::numeric_limits<std::uint32_t>::max())
+      .def_readwrite("max_order_quantity", &cmf::RiskLimits::max_order_quantity)
+      .def_readwrite("max_position_abs", &cmf::RiskLimits::max_position_abs)
+      .def_readwrite("max_open_orders_per_instrument",
+                     &cmf::RiskLimits::max_open_orders_per_instrument);
 
   py::class_<cmf::BacktestConfig>(module, "BacktestConfig")
       .def(py::init([](cmf::TimestampNs market_data_latency_ns,
                        cmf::TimestampNs order_latency_ns,
-                       std::uint32_t book_depth) {
+                       std::uint32_t book_depth, cmf::RiskLimits risk) {
              return cmf::BacktestConfig{market_data_latency_ns,
-                                        order_latency_ns, book_depth};
+                                        order_latency_ns, book_depth, risk};
            }),
            py::arg("market_data_latency_ns") = 0,
            py::arg("order_latency_ns") = cmf::runtime::default_order_latency_ns,
-           py::arg("book_depth") = 15)
+           py::arg("book_depth") = 15, py::arg("risk") = cmf::RiskLimits{})
       .def_readwrite("market_data_latency_ns",
                      &cmf::BacktestConfig::market_data_latency_ns)
       .def_readwrite("order_latency_ns", &cmf::BacktestConfig::order_latency_ns)
-      .def_readwrite("book_depth", &cmf::BacktestConfig::book_depth);
+      .def_readwrite("book_depth", &cmf::BacktestConfig::book_depth)
+      .def_readwrite("risk", &cmf::BacktestConfig::risk);
 
   py::class_<cmf::DateRange>(module, "DateRange")
       .def(py::init<cmf::TimestampNs, cmf::TimestampNs>(),
@@ -457,4 +481,99 @@ PYBIND11_MODULE(_backtester, module) {
         return elapsed.count();
       },
       py::arg("strategy"), py::arg("depth"), py::arg("iterations") = 1'000);
+
+  // Native baseline for the callback benchmark: the same loop shape and the
+  // same payload, dispatched through the C++ Strategy interface and never
+  // crossing into Python. Subtracting this from the Python figure is what
+  // isolates the cost of the boundary itself.
+  //
+  // The accumulator exists so a side-effect-free Release loop is not simply
+  // deleted; it is returned alongside the timing so nothing can be elided.
+  module.def(
+      "_benchmark_native_callbacks",
+      [](std::size_t depth, std::size_t iterations) {
+        if (depth == 0 || iterations == 0) {
+          throw std::invalid_argument(
+              "benchmark depth and iterations must be positive");
+        }
+        std::vector<BookLevel> bids;
+        std::vector<BookLevel> asks;
+        bids.reserve(depth);
+        asks.reserve(depth);
+        for (std::size_t index = 0; index < depth; ++index) {
+          const auto offset = static_cast<PriceTicks>(index);
+          bids.push_back(BookLevel{100 - offset, 1});
+          asks.push_back(BookLevel{101 + offset, 1});
+        }
+
+        struct CountingStrategy final : trading::Strategy {
+          std::size_t seen{};
+          void on_book_update(const BookUpdateView &update,
+                              trading::StrategyContext &) override {
+            seen += update.bids.size();
+          }
+        };
+        // A real context object rather than a null reference, so the loop is
+        // well defined under UBSan. The benchmark strategy never calls it.
+        struct UnusedContext final : trading::StrategyContext {
+          ClOrdId submit_limit(InstrumentId, Side, PriceTicks,
+                               Quantity) override {
+            throw std::logic_error("benchmark strategy must not trade");
+          }
+          bool cancel_order(ClOrdId) override {
+            throw std::logic_error("benchmark strategy must not trade");
+          }
+          [[nodiscard]] TimestampNs now_ns() const noexcept override {
+            return 0;
+          }
+          [[nodiscard]] PositionSnapshot position(InstrumentId) const override {
+            throw std::logic_error("benchmark strategy must not query");
+          }
+          [[nodiscard]] std::span<const OrderQueryRow>
+          open_orders(InstrumentId) override {
+            throw std::logic_error("benchmark strategy must not query");
+          }
+        };
+
+        CountingStrategy counting;
+        UnusedContext context;
+        // Called through the base pointer so the virtual dispatch survives.
+        trading::Strategy *strategy = &counting;
+
+        std::chrono::nanoseconds elapsed;
+        {
+          py::gil_scoped_release release;
+          const BookUpdateView update{1, 0, 0, 1, false, bids, asks};
+          const auto start = std::chrono::steady_clock::now();
+          for (std::size_t index = 0; index < iterations; ++index) {
+            strategy->on_book_update(update, context);
+          }
+          elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - start);
+        }
+        return py::make_tuple(elapsed.count(), counting.seen);
+      },
+      py::arg("depth"), py::arg("iterations") = 1'000);
+
+  // Acquire and release the GIL without calling anything, so the callback
+  // figure can be split into "taking the lock" and "everything else".
+  module.def(
+      "_benchmark_gil_cycles",
+      [](std::size_t iterations) {
+        if (iterations == 0) {
+          throw std::invalid_argument("benchmark iterations must be positive");
+        }
+        std::chrono::nanoseconds elapsed;
+        {
+          py::gil_scoped_release release;
+          const auto start = std::chrono::steady_clock::now();
+          for (std::size_t index = 0; index < iterations; ++index) {
+            py::gil_scoped_acquire acquire;
+          }
+          elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - start);
+        }
+        return elapsed.count();
+      },
+      py::arg("iterations") = 1'000);
 }

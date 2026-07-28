@@ -11,10 +11,6 @@ namespace {
          state == OrderState::Rejected;
 }
 
-[[nodiscard]] bool valid_side(Side side) noexcept {
-  return side == Side::Buy || side == Side::Sell;
-}
-
 } // namespace
 
 TradingEngine::TradingEngine(std::span<const InstrumentMeta> instruments,
@@ -22,7 +18,7 @@ TradingEngine::TradingEngine(std::span<const InstrumentMeta> instruments,
                              const market::HistoricalLOBStore &books,
                              Strategy &strategy, Recorder &recorder)
     : config_(config), books_(books), strategy_(strategy), recorder_(recorder),
-      simulated_lob_(instruments) {
+      risk_(instruments, config.risk), simulated_lob_(instruments) {
   if (config_.market_data_latency_ns < 0 || config_.order_latency_ns <= 0 ||
       config_.book_depth == 0) {
     throw std::invalid_argument("invalid backtest configuration");
@@ -74,23 +70,19 @@ TradingEngine::find_instrument(InstrumentId instrument_id) const noexcept {
 RejectReason TradingEngine::validate_order(InstrumentId instrument_id,
                                            Side side, PriceTicks price,
                                            Quantity quantity) const noexcept {
-  const auto *meta = find_instrument(instrument_id);
-  if (meta == nullptr) {
-    return RejectReason::UnknownInstrument;
+  // RiskEngine owns the decision and its ordering. This function only gathers
+  // the state it needs, so validity rules and limits cannot drift apart.
+  Quantity net_position{};
+  std::size_t open_orders{};
+  if (find_instrument(instrument_id) != nullptr) {
+    net_position = positions_.position(instrument_id).net_quantity;
+    const auto indexed = open_order_ids_.find(instrument_id);
+    if (indexed != open_order_ids_.end()) {
+      open_orders = indexed->second.size();
+    }
   }
-  if (!valid_side(side)) {
-    return RejectReason::InvalidSide;
-  }
-  if (quantity <= 0) {
-    return RejectReason::NonPositiveQuantity;
-  }
-  if (price <= 0) {
-    return RejectReason::InvalidPrice;
-  }
-  if (price % meta->tick_size_ticks != 0) {
-    return RejectReason::TickMisalignment;
-  }
-  return RejectReason::None;
+  return risk_.check_new_order(instrument_id, side, price, quantity,
+                               net_position, open_orders);
 }
 
 void TradingEngine::ensure_active_sink() const {

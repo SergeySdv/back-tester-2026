@@ -19,3 +19,8 @@ if(BUILD_TESTS)
     enable_testing()
     add_subdirectory(test)
 endif()
+
+option(BUILD_BENCHMARKS "Build the benchmark executables" ON)
+if(BUILD_BENCHMARKS)
+    add_subdirectory(bench)
+endif()

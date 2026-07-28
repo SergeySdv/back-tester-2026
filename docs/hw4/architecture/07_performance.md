@@ -33,7 +33,7 @@ does not justify their complexity.
 Executable:
 
 ```bash
-build-release/bin/test/back-tester-scheduler-benchmark
+build-release/bin/bench/back-tester-scheduler-benchmark
 ```
 
 The measured interval is:
@@ -54,7 +54,7 @@ strategy, minimum, mean, p50, p95, and p99 nanoseconds.
 Executable:
 
 ```bash
-build-release/bin/test/back-tester-price-cross-benchmark
+build-release/bin/bench/back-tester-price-cross-benchmark
 ```
 
 This measures the Option B hot path that the ready benchmark deliberately
