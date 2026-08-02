@@ -1,5 +1,7 @@
 #include "core/BacktestConfig.hpp"
 #include "core/Events.hpp"
+#include "market/JsonlReader.hpp"
+#include "market/Parsing.hpp"
 #include "results/ResultRecorder.hpp"
 #include "runtime/BacktestRuntime.hpp"
 #include "trading/Strategy.hpp"
@@ -8,6 +10,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <limits>
@@ -17,6 +20,8 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -248,6 +253,205 @@ private:
   std::shared_ptr<results::FrozenResults> frozen_;
 };
 
+template <typename Value>
+py::array_t<Value, py::array::c_style | py::array::forcecast>
+required_array(const py::dict &columns, const char *name) {
+  if (!columns.contains(name)) {
+    throw std::invalid_argument(std::string("missing event column '") + name +
+                                "'");
+  }
+  auto result =
+      py::array_t<Value, py::array::c_style | py::array::forcecast>::ensure(
+          columns[name]);
+  if (!result || result.ndim() != 1) {
+    throw std::invalid_argument(std::string("event column '") + name +
+                                "' must be one-dimensional");
+  }
+  return result;
+}
+
+cmf::market::MarketAction parse_action(const std::string &value) {
+  if (value.size() != 1) {
+    throw std::invalid_argument("action must contain one character");
+  }
+  switch (value.front()) {
+  case 'A':
+    return cmf::market::MarketAction::Add;
+  case 'C':
+    return cmf::market::MarketAction::Cancel;
+  case 'M':
+    return cmf::market::MarketAction::Modify;
+  case 'T':
+    return cmf::market::MarketAction::Trade;
+  case 'F':
+    return cmf::market::MarketAction::Fill;
+  case 'R':
+    return cmf::market::MarketAction::Clear;
+  default:
+    throw std::invalid_argument("action has an unsupported value");
+  }
+}
+
+cmf::Side parse_side(const py::handle &value, bool required) {
+  if (value.is_none()) {
+    if (required) {
+      throw std::invalid_argument("side is required for this action");
+    }
+    return cmf::Side::None;
+  }
+  const auto text = py::cast<std::string>(value);
+  if (text == "B") {
+    return cmf::Side::Buy;
+  }
+  if (text == "A" || text == "S") {
+    return cmf::Side::Sell;
+  }
+  if (!required && (text.empty() || text == "N")) {
+    return cmf::Side::None;
+  }
+  throw std::invalid_argument("side has an unsupported value");
+}
+
+std::vector<cmf::InstrumentMeta> discover_instruments(
+    const py::array_t<cmf::InstrumentId,
+                      py::array::c_style | py::array::forcecast> &ids) {
+  std::unordered_set<cmf::InstrumentId> unique;
+  const auto values = ids.unchecked<1>();
+  for (py::ssize_t index = 0; index < values.shape(0); ++index) {
+    if (values(index) <= 0) {
+      throw std::invalid_argument("instrument_id must be positive");
+    }
+    unique.insert(values(index));
+  }
+  const auto policy = cmf::market::JsonlReader::databento_nanounit_policy();
+  std::vector<cmf::InstrumentMeta> result;
+  result.reserve(unique.size());
+  for (const auto id : unique) {
+    result.push_back(cmf::InstrumentMeta{id, policy.tick_size_ticks,
+                                         policy.price_scale,
+                                         policy.contract_multiplier});
+  }
+  std::sort(result.begin(), result.end(),
+            [](const auto &left, const auto &right) {
+              return left.instrument_id < right.instrument_id;
+            });
+  return result;
+}
+
+std::vector<cmf::market::MarketDataEvent>
+parse_events(const py::dict &columns, const std::string &source_name,
+             std::vector<cmf::InstrumentMeta> &instruments) {
+  const auto receive = required_array<cmf::TimestampNs>(columns, "ts_recv");
+  const auto exchange = required_array<cmf::TimestampNs>(columns, "ts_event");
+  const auto instrument =
+      required_array<cmf::InstrumentId>(columns, "instrument_id");
+  const auto quantity = required_array<cmf::Quantity>(columns, "size");
+  const auto flags = required_array<std::uint32_t>(columns, "flags");
+  const auto sequence = required_array<cmf::Sequence>(columns, "sequence");
+  const py::sequence order_ids = columns["order_id"].cast<py::sequence>();
+  const py::sequence actions = columns["action"].cast<py::sequence>();
+  const py::sequence sides = columns["side"].cast<py::sequence>();
+  const py::sequence prices = columns["price"].cast<py::sequence>();
+
+  const py::ssize_t size = receive.shape(0);
+  for (const py::ssize_t candidate :
+       {exchange.shape(0), instrument.shape(0), quantity.shape(0),
+        flags.shape(0), sequence.shape(0),
+        static_cast<py::ssize_t>(py::len(order_ids)),
+        static_cast<py::ssize_t>(py::len(actions)),
+        static_cast<py::ssize_t>(py::len(sides)),
+        static_cast<py::ssize_t>(py::len(prices))}) {
+    if (candidate != size) {
+      throw std::invalid_argument("event columns must have equal lengths");
+    }
+  }
+  if (instruments.empty()) {
+    instruments = discover_instruments(instrument);
+  }
+  std::unordered_map<cmf::InstrumentId, cmf::InstrumentMeta> metadata;
+  for (const auto &meta : instruments) {
+    metadata.emplace(meta.instrument_id, meta);
+  }
+
+  const auto receive_values = receive.unchecked<1>();
+  const auto exchange_values = exchange.unchecked<1>();
+  const auto instrument_values = instrument.unchecked<1>();
+  const auto quantity_values = quantity.unchecked<1>();
+  const auto flag_values = flags.unchecked<1>();
+  const auto sequence_values = sequence.unchecked<1>();
+  std::vector<cmf::market::MarketDataEvent> events;
+  events.reserve(static_cast<std::size_t>(size));
+
+  for (py::ssize_t index = 0; index < size; ++index) {
+    try {
+      cmf::market::MarketDataEvent event;
+      event.receive_ts_ns = receive_values(index);
+      event.exchange_ts_ns = exchange_values(index);
+      event.instrument_id = instrument_values(index);
+      event.source_sequence = sequence_values(index);
+      event.flags = flag_values(index);
+      event.action = parse_action(py::cast<std::string>(actions[index]));
+      const bool needs_side =
+          event.action == cmf::market::MarketAction::Add ||
+          event.action == cmf::market::MarketAction::Modify ||
+          event.action == cmf::market::MarketAction::Trade;
+      event.side = parse_side(sides[index], needs_side);
+
+      const auto meta = metadata.find(event.instrument_id);
+      if (meta == metadata.end()) {
+        throw std::invalid_argument("unknown instrument_id " +
+                                    std::to_string(event.instrument_id));
+      }
+      const bool needs_order =
+          event.action != cmf::market::MarketAction::Clear &&
+          event.action != cmf::market::MarketAction::Trade;
+      if (!order_ids[index].is_none()) {
+        event.exchange_order_id =
+            py::cast<cmf::ExchangeOrderId>(order_ids[index]);
+      } else if (needs_order) {
+        throw std::invalid_argument("order_id is required for this action");
+      }
+      const bool needs_quantity =
+          event.action == cmf::market::MarketAction::Add ||
+          event.action == cmf::market::MarketAction::Modify ||
+          event.action == cmf::market::MarketAction::Fill ||
+          event.action == cmf::market::MarketAction::Trade;
+      if (needs_quantity) {
+        event.quantity = quantity_values(index);
+        if (event.quantity <= 0) {
+          throw std::invalid_argument("size must be positive for this action");
+        }
+      }
+      const bool needs_price =
+          event.action == cmf::market::MarketAction::Add ||
+          event.action == cmf::market::MarketAction::Modify ||
+          event.action == cmf::market::MarketAction::Trade;
+      if (needs_price) {
+        if (prices[index].is_none()) {
+          throw std::invalid_argument("price is required for this action");
+        }
+        event.price_ticks = cmf::market::parse_decimal_ticks(
+            py::cast<std::string>(prices[index]), meta->second.price_scale,
+            meta->second.tick_size_ticks);
+      }
+      if (!events.empty() &&
+          event.exchange_ts_ns < events.back().exchange_ts_ns) {
+        throw std::invalid_argument("exchange timestamp regressed");
+      }
+      if (!events.empty() &&
+          event.source_sequence <= events.back().source_sequence) {
+        throw std::invalid_argument(
+            "source sequence is not strictly increasing");
+      }
+      events.push_back(event);
+    } catch (const std::exception &error) {
+      throw std::invalid_argument(
+          source_name + ":" + std::to_string(index + 1) + ": " + error.what());
+    }
+  }
+  return events;
+}
+
 } // namespace
 
 PYBIND11_MODULE(_backtester, module) {
@@ -423,6 +627,36 @@ PYBIND11_MODULE(_backtester, module) {
       },
       py::arg("strategy"), py::arg("data_path"), py::arg("date_range"),
       py::arg("config") = py::none(), py::arg("instruments") = py::none());
+
+  module.def(
+      "_run_events",
+      [](py::object strategy, const py::dict &columns,
+         const std::string &source_name, cmf::DateRange date_range,
+         std::optional<cmf::BacktestConfig> optional_config,
+         std::optional<std::vector<cmf::InstrumentMeta>> optional_instruments) {
+        auto handle = strategy.cast<std::shared_ptr<PythonStrategyHandle>>();
+        StrategyRunGuard run_guard(*handle);
+        cmf::BacktestConfig config = optional_config.value_or(
+            cmf::BacktestConfig{0, cmf::runtime::default_order_latency_ns, 15});
+        if (optional_instruments.has_value() && optional_instruments->empty()) {
+          throw std::invalid_argument("at least one instrument is required");
+        }
+        std::vector<cmf::InstrumentMeta> instruments =
+            optional_instruments.value_or(std::vector<cmf::InstrumentMeta>{});
+        auto events = parse_events(columns, source_name, instruments);
+        PythonStrategyAdapter adapter(std::move(strategy), handle);
+        cmf::results::FrozenResults frozen;
+        {
+          py::gil_scoped_release release;
+          frozen = cmf::runtime::run_backtest_events(
+              adapter, std::move(events), source_name, date_range, config,
+              std::move(instruments));
+        }
+        return PythonResult{std::move(frozen)};
+      },
+      py::arg("strategy"), py::arg("columns"), py::arg("source_name"),
+      py::arg("date_range"), py::arg("config") = py::none(),
+      py::arg("instruments") = py::none());
 
   module.def(
       "_benchmark_book_callbacks",

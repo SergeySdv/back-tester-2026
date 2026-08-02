@@ -136,6 +136,7 @@ is not produced by the full-fill-on-cross matcher.
 - No self-matching between private strategy orders.
 - No exercise, assignment, expiration settlement, Greeks, volatility surface,
   or complete options risk engine.
-- No Feather input, database, persistence layer, UI, or generic plugin system.
+- Feather V2 input is available through the Python API; the C++ CLI remains
+  JSONL-only. No database, persistence layer, UI, or generic plugin system.
 - The shipped runtime has one trading `EngineView`; isolation between typed
   `SimulatedLOB` instances is tested but is not exposed by `backtest.run()`.

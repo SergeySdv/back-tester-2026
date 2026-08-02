@@ -50,7 +50,7 @@ component, represented at the boundary, or intentionally outside scope.
 | Diagram box or flow | Final implementation disposition | Code / evidence |
 |---|---|---|
 | Databento JSON data source | Implemented as streaming Databento-like MBO JSONL | `src/market/JsonlReader.*`, `test/data/*.jsonl` |
-| Feather data source | Not implemented; the runtime input contract is JSONL | architecture scope/limitations |
+| Feather data source | Implemented for Python `backtest.run()` through validated Arrow IPC columns and native in-memory events; C++ CLI remains JSONL-only | `python/back_tester/_input.py`, `src/python/bindings.cpp`, `python/tests/test_feather.py` |
 | Event Merger | One prefetched market source is dynamically merged with delayed strategy commands | `src/scheduler/SchedulerRuntime.hpp` |
 | Chronological Dispatcher | Implemented with stable key `(scheduled time, priority, sequence)` | `ChronologicalScheduler.*`, scheduler ordering tests |
 | Map of LOBs per instrument | Implemented by `HistoricalLOBStore` | `src/market/HistoricalLOBStore.*` |

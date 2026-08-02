@@ -6,7 +6,9 @@
 #include "trading/TradingEngine.hpp"
 
 #include <algorithm>
+#include <functional>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <unordered_map>
@@ -39,13 +41,13 @@ struct CachedDepth {
   std::vector<BookLevel> asks;
 };
 
-class JsonlScheduledSource {
+class ScheduledSource {
 public:
-  JsonlScheduledSource(std::string path,
-                       market::JsonlReader::InstrumentMap instruments,
-                       market::HistoricalLOBStore &books, DateRange range,
-                       BacktestConfig config)
-      : path_(path), reader_(std::move(path), std::move(instruments)),
+  ScheduledSource(std::string path,
+                  std::function<bool(market::MarketDataEvent &)> next_event,
+                  market::HistoricalLOBStore &books, DateRange range,
+                  BacktestConfig config)
+      : path_(std::move(path)), next_event_(std::move(next_event)),
         books_(books), range_(range), config_(config) {
     group_.reserve(8);
     bids_.reserve(config.book_depth);
@@ -68,7 +70,7 @@ public:
 
     for (;;) {
       market::MarketDataEvent first;
-      if (!reader_.next(first)) {
+      if (!next(first)) {
         return false;
       }
 
@@ -78,15 +80,15 @@ public:
       group_.push_back(first);
       while (!group_.back().is_last_in_group()) {
         market::MarketDataEvent next_event;
-        if (!reader_.next(next_event)) {
+        if (!next(next_event)) {
           throw market::SourceError(
-              path_, reader_.row(), {},
+              path_, row_, {},
               "unterminated atomic market group at end of file");
         }
         if (next_event.instrument_id != instrument_id ||
             next_event.exchange_ts_ns != exchange_time) {
           throw market::SourceError(
-              path_, reader_.row(), {},
+              path_, row_, {},
               "atomic market group changed instrument or exchange timestamp");
         }
         group_.push_back(next_event);
@@ -219,6 +221,14 @@ public:
   }
 
 private:
+  bool next(market::MarketDataEvent &event) {
+    if (!next_event_(event)) {
+      return false;
+    }
+    ++row_;
+    return true;
+  }
+
   CachedDepth &cached_depth(InstrumentId instrument_id) {
     auto [iterator, inserted] =
         previous_depth_.try_emplace(instrument_id, CachedDepth{});
@@ -240,7 +250,7 @@ private:
   }
 
   std::string path_;
-  market::JsonlReader reader_;
+  std::function<bool(market::MarketDataEvent &)> next_event_;
   market::HistoricalLOBStore &books_;
   DateRange range_;
   BacktestConfig config_;
@@ -251,6 +261,7 @@ private:
   std::vector<TradeView> trades_;
   std::vector<PriceCrossSignal> price_cross_signals_;
   bool group_staged_{};
+  std::size_t row_{};
 };
 
 void validate(DateRange range, BacktestConfig config,
@@ -277,6 +288,36 @@ void validate(DateRange range, BacktestConfig config,
       throw std::invalid_argument("duplicate instrument metadata");
     }
   }
+}
+
+template <typename SourceFactory>
+results::FrozenResults
+replay(trading::Strategy &strategy, DateRange date_range, BacktestConfig config,
+       std::vector<InstrumentMeta> instruments, SourceFactory make_source) {
+  validate(date_range, config, instruments);
+  market::HistoricalLOBStore books;
+  results::ResultRecorder recorder(
+      instruments, results::ResultReserveEstimate{64, 128, 128, 16});
+  trading::TradingEngine engine(instruments, config, books, strategy, recorder);
+  auto source = make_source(books);
+  scheduler::SchedulerRuntime scheduler(
+      scheduler::SchedulerRuntimeConfig{date_range, 1, 64, 4096});
+  scheduler.run(source, [&](const ScheduledEvent &event,
+                            scheduler::CommandSink &commands) {
+    engine(event, commands);
+    const auto *delivery = std::get_if<MarketDelivery>(&event.payload());
+    if (delivery == nullptr || !delivery->book_update.has_value()) {
+      return;
+    }
+    const auto *book = books.find(delivery->instrument_id);
+    const auto bid = book->best_bid();
+    const auto ask = book->best_ask();
+    recorder.on_book_mark(
+        delivery->instrument_id, delivery->engine_ts_ns,
+        bid.has_value() ? std::optional<PriceTicks>{bid->price} : std::nullopt,
+        ask.has_value() ? std::optional<PriceTicks>{ask->price} : std::nullopt);
+  });
+  return recorder.freeze();
 }
 
 } // namespace
@@ -312,37 +353,47 @@ results::FrozenResults run_backtest(trading::Strategy &strategy,
                                     const std::string &data_path,
                                     DateRange date_range, BacktestConfig config,
                                     std::vector<InstrumentMeta> instruments) {
-  validate(date_range, config, instruments);
   market::JsonlReader::InstrumentMap metadata;
   metadata.reserve(instruments.size());
   for (const auto &meta : instruments) {
     metadata.emplace(meta.instrument_id, meta);
   }
 
-  market::HistoricalLOBStore books;
-  results::ResultRecorder recorder(
-      instruments, results::ResultReserveEstimate{64, 128, 128, 16});
-  trading::TradingEngine engine(instruments, config, books, strategy, recorder);
-  JsonlScheduledSource source(data_path, std::move(metadata), books, date_range,
-                              config);
-  scheduler::SchedulerRuntime scheduler(
-      scheduler::SchedulerRuntimeConfig{date_range, 1, 64, 4096});
-  scheduler.run(source, [&](const ScheduledEvent &event,
-                            scheduler::CommandSink &commands) {
-    engine(event, commands);
-    const auto *delivery = std::get_if<MarketDelivery>(&event.payload());
-    if (delivery == nullptr || !delivery->book_update.has_value()) {
-      return;
-    }
-    const auto *book = books.find(delivery->instrument_id);
-    const auto bid = book->best_bid();
-    const auto ask = book->best_ask();
-    recorder.on_book_mark(
-        delivery->instrument_id, delivery->engine_ts_ns,
-        bid.has_value() ? std::optional<PriceTicks>{bid->price} : std::nullopt,
-        ask.has_value() ? std::optional<PriceTicks>{ask->price} : std::nullopt);
-  });
-  return recorder.freeze();
+  return replay(strategy, date_range, config, std::move(instruments),
+                [data_path, metadata = std::move(metadata), date_range,
+                 config](market::HistoricalLOBStore &books) mutable {
+                  auto reader = std::make_shared<market::JsonlReader>(
+                      data_path, std::move(metadata));
+                  return ScheduledSource{
+                      data_path,
+                      [reader](market::MarketDataEvent &event) {
+                        return reader->next(event);
+                      },
+                      books, date_range, config};
+                });
+}
+
+results::FrozenResults run_backtest_events(
+    trading::Strategy &strategy, std::vector<market::MarketDataEvent> events,
+    std::string source_name, DateRange date_range, BacktestConfig config,
+    std::vector<InstrumentMeta> instruments) {
+  return replay(
+      strategy, date_range, config, std::move(instruments),
+      [events = std::move(events), source_name = std::move(source_name),
+       date_range, config](market::HistoricalLOBStore &books) mutable {
+        auto rows = std::make_shared<std::vector<market::MarketDataEvent>>(
+            std::move(events));
+        auto index = std::make_shared<std::size_t>(0);
+        return ScheduledSource{source_name,
+                               [rows, index](market::MarketDataEvent &event) {
+                                 if (*index == rows->size()) {
+                                   return false;
+                                 }
+                                 event = (*rows)[(*index)++];
+                                 return true;
+                               },
+                               books, date_range, config};
+      });
 }
 
 } // namespace cmf::runtime

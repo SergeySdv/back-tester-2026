@@ -17,9 +17,9 @@ from ._backtester import (
     Side,
     Strategy,
     Trade,
-    run,
     version,
 )
+from ._input import run
 
 
 class _Backtest:

@@ -45,8 +45,8 @@ The distribution name is `back-tester-cmf`. Its import package is
 
 ## Python strategy API
 
-`backtest.run()` drives the real streaming JSONL reader, historical book,
-scheduler, trading engine, and native result recorder:
+`backtest.run()` drives the historical book, scheduler, trading engine, and
+native result recorder from Databento-like JSONL or Feather V2 input:
 
 ```python
 from back_tester import DateRange, Side, Strategy, backtest
@@ -71,6 +71,22 @@ metadata pass and then replays the file as a stream. It uses Databento
 nanounits (`price_scale=1_000_000_000`, tick size 1, multiplier 1). Pass an
 explicit `instruments=[InstrumentMeta(...)]` list for a one-pass replay and
 real tick sizes or option multipliers.
+
+Convert a directory of `*.mbo.json` files and replay the generated Feather
+file through the same Python API:
+
+```bash
+uv run python scripts/convert_to_feather.py data/
+```
+
+```python
+result = backtest.run(BuyTouch(), "data/sample.mbo.feather", DateRange())
+```
+
+Feather input must contain flattened `ts_recv`, `ts_event`, `instrument_id`,
+`order_id`, `action`, `side`, `price`, `size`, `flags`, and `sequence` columns.
+The Python loader validates the table, converts it once to native market events,
+then releases the GIL for replay. The C++ CLI remains JSONL-only.
 
 The optional `BacktestConfig` defaults to zero market-data latency, a strictly
 positive one-nanosecond order latency, and top-15 callbacks. Strategy context
@@ -157,8 +173,9 @@ A missing or unreadable path exits with status 2.
   extension point.
 - Only limit GTC submission and cancel are supported. Replace, IOC/FOK,
   post-only, stops, pegs, and multi-leg orders are out of scope.
-- Input support is Databento-like MBO JSONL. Options exercise, assignment,
-  expiry settlement, Greeks, and a full risk engine are not implemented.
+- Python input supports Databento-like MBO JSONL and flattened Feather V2. The
+  C++ CLI remains JSONL-only. Options exercise, assignment, expiry settlement,
+  Greeks, and a full risk engine are not implemented.
 
 ## Development checks
 
