@@ -121,6 +121,63 @@ TEST_CASE("Runtime applies a prefetched market group only at dispatch",
   REQUIRE(frozen.fills().engine_ts_ns.front() == 200);
 }
 
+TEST_CASE("Order does not fill against touch removed before delayed arrival",
+          "[Runtime][Latency]")
+{
+    TempFile source("back-tester-runtime-vanished-touch.jsonl");
+    {
+        std::ofstream output(source.getPath());
+        output
+            << R"({"ts_recv":"1970-01-01T00:00:00.000000100Z","hd":{"ts_event":"1970-01-01T00:00:00.000000100Z","instrument_id":1},"action":"A","side":"A","price":"100","size":10,"order_id":"11","flags":128,"sequence":1})"
+            << '\n'
+            << R"({"ts_recv":"1970-01-01T00:00:00.000000150Z","hd":{"ts_event":"1970-01-01T00:00:00.000000150Z","instrument_id":1},"action":"C","side":"A","price":"100","size":10,"order_id":"11","flags":0,"sequence":2})"
+            << '\n'
+            << R"({"ts_recv":"1970-01-01T00:00:00.000000150Z","hd":{"ts_event":"1970-01-01T00:00:00.000000150Z","instrument_id":1},"action":"A","side":"A","price":"105","size":10,"order_id":"12","flags":128,"sequence":3})"
+            << '\n'
+            << R"({"ts_recv":"1970-01-01T00:00:00.000000300Z","hd":{"ts_event":"1970-01-01T00:00:00.000000300Z","instrument_id":1},"action":"A","side":"A","price":"104","size":1,"order_id":"13","flags":128,"sequence":4})"
+            << '\n';
+    }
+
+    class VanishedTouchStrategy final : public trading::Strategy
+    {
+      public:
+        void on_book_update(const BookUpdateView& view,
+                            trading::StrategyContext& context) override
+        {
+            if (order_id == 0)
+            {
+                order_id = context.submit_limit(view.instrument_id, Side::Buy,
+                                                100'000'000'000, 1);
+            }
+            const auto open = context.open_orders(view.instrument_id);
+            open_at_last_callback.assign(open.begin(), open.end());
+        }
+
+        void on_fill(const FillView&, trading::StrategyContext&) override
+        {
+            ++fill_count;
+        }
+
+        ClOrdId order_id{};
+        int fill_count{};
+        std::vector<OrderQueryRow> open_at_last_callback;
+    } strategy;
+
+    const auto frozen = runtime::run_backtest(
+        strategy, source.getPath().string(), DateRange{},
+        BacktestConfig{0, 100, 1},
+        std::vector{InstrumentMeta{1, 1, 1'000'000'000, 1}});
+
+    REQUIRE(strategy.fill_count == 0);
+    REQUIRE(frozen.fills().size() == 0);
+    REQUIRE(strategy.open_at_last_callback.size() == 1);
+    REQUIRE(strategy.open_at_last_callback[0].client_order_id ==
+            strategy.order_id);
+    REQUIRE(strategy.open_at_last_callback[0].state == OrderState::Open);
+    REQUIRE(strategy.open_at_last_callback[0].limit_price_ticks ==
+            100'000'000'000);
+}
+
 TEST_CASE("Runtime suppresses empty depth until the first actual change",
           "[Runtime]") {
   TempFile source("back-tester-runtime-empty-depth.jsonl");

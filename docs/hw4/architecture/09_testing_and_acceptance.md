@@ -22,6 +22,9 @@ The `back-tester-tests` executable covers:
   ordered selected warm-up, full winner-identity lifecycle checks,
   selected-record conservation/full-replay audit, and global sequences.
 
+Its MiniTest cases are registered individually with CTest, so failures name the
+case and `ctest -R <pattern>` can select a focused native test.
+
 CTest also verifies CLI usage and valid/invalid checked-in fixtures.
 
 ### Python integration tests

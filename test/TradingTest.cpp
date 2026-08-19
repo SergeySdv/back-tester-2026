@@ -399,6 +399,61 @@ TEST_CASE("Cancel is delayed and equal-time market fill wins", "[Trading]") {
   REQUIRE(strategy.rejects[0].reason == RejectReason::AlreadyTerminal);
 }
 
+TEST_CASE("Fill during cancel flight wins before delayed cancel arrival",
+          "[Trading][CancelRace]")
+{
+    HistoricalLOBStore books;
+    struct CancelInFlight final : RecordingStrategy
+    {
+        ClOrdId id{};
+        int callbacks{};
+        bool cancel_queued{};
+
+        void on_book_update(const BookUpdateView&,
+                            StrategyContext& context) override
+        {
+            ++callbacks;
+            if (callbacks == 1)
+            {
+                id = context.submit_limit(1, Side::Buy, 100, 5);
+            }
+            else if (callbacks == 2)
+            {
+                cancel_queued = context.cancel_order(id);
+            }
+        }
+    } strategy;
+    RecordingRecorder recorder;
+    TradingEngine engine(instruments, BacktestConfig{0, 100, 1}, books, strategy,
+                         recorder);
+
+    const auto view100 = empty_book_view(100, 1);
+    const auto view300 = empty_book_view(300, 2);
+    const std::array cross350{trade_signal(350, 3, 100)};
+    const std::array events{
+        ScheduledEvent{MarketDelivery{1, 100, 100, 1, view100, {}, {}}},
+        ScheduledEvent{MarketDelivery{1, 300, 300, 2, view300, {}, {}}},
+        ScheduledEvent{MarketDelivery{1, 350, 350, 3, {}, {}, cross350}}};
+    SchedulerRuntime runtime(SchedulerRuntimeConfig{DateRange{}, 1, 8, 16});
+    runtime.run(events, engine);
+
+    REQUIRE(strategy.cancel_queued);
+    REQUIRE(strategy.fills.size() == 1);
+    REQUIRE(strategy.fills[0].client_order_id == strategy.id);
+    REQUIRE(strategy.fills[0].engine_ts_ns == 350);
+    REQUIRE(strategy.fills[0].remaining_quantity == 0);
+    REQUIRE(strategy.rejects.size() == 1);
+    REQUIRE(strategy.rejects[0].client_order_id == strategy.id);
+    REQUIRE(strategy.rejects[0].reason == RejectReason::AlreadyTerminal);
+    REQUIRE(strategy.rejects[0].engine_ts_ns == 400);
+    REQUIRE(engine.open_orders(1).empty());
+    REQUIRE(std::none_of(recorder.orders.begin(), recorder.orders.end(),
+                         [](const OrderLogResultRow& row)
+                         {
+                             return row.event_type == OrderLogEventType::Cancelled;
+                         }));
+}
+
 TEST_CASE("Cancel arriving before a later price cross prevents fill",
           "[Trading]") {
   HistoricalLOBStore books;
