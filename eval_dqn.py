@@ -1,5 +1,5 @@
 """
-Честная out-of-sample оценка DQN на TEST-сегменте + walk-forward (5 окон)
+Честная out-of-sample оценка DQN на TEST-сегменте + chronological fold evaluation (5 окон)
 + permutation test.
 
 ВАЖНО про permutation test: перемешивается НЕ последовательность действий
@@ -17,6 +17,7 @@
         --model research_pipeline/ml/dqn_model_traintest.pt \
         --meta research_pipeline/ml/dqn_meta_traintest.json
 """
+
 from __future__ import annotations
 
 import argparse
@@ -27,8 +28,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from research_pipeline.ml.feature_extraction import extract_feature_rows
+
 TRANSACTION_COST = 0.5
-N_WALKFORWARD_FOLDS = 5
+N_CHRONOLOGICAL_FOLDS = 5
 N_PERMUTATIONS = 100
 
 
@@ -36,8 +39,10 @@ class QNet(nn.Module):
     def __init__(self, state_dim, n_actions=3):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(state_dim, 64), nn.ReLU(),
-            nn.Linear(64, 64), nn.ReLU(),
+            nn.Linear(state_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 64),
+            nn.ReLU(),
             nn.Linear(64, n_actions),
         )
 
@@ -46,57 +51,21 @@ class QNet(nn.Module):
 
 
 def precompute_trajectory(path: str):
-    state = {"best_bid": None, "best_ask": None, "bid_qty": 0, "ask_qty": 0}
-    imbalance_hist, mid_hist = [], []
-    feats_list, mid_list = [], []
-
-    with open(path) as f:
-        for line in f:
-            event = json.loads(line)
-            if event["hd"]["instrument_id"] != 1:
-                continue
-            action = event["action"]
-            if action == "T":
-                continue
-            if action in ("A", "M"):
-                price = int(event["price"])
-                size = event["size"]
-                side = event["side"]
-                if side == "B":
-                    state["best_bid"] = price
-                    state["bid_qty"] = size
-                elif side == "A":
-                    state["best_ask"] = price
-                    state["ask_qty"] = size
-            else:
-                continue
-
-            if state["best_bid"] is None or state["best_ask"] is None:
-                continue
-            bid_qty, ask_qty = state["bid_qty"], state["ask_qty"]
-            total = bid_qty + ask_qty
-            if total == 0:
-                continue
-
-            imbalance = (bid_qty - ask_qty) / total
-            spread = state["best_ask"] - state["best_bid"]
-            mid = (state["best_bid"] + state["best_ask"]) / 2
-
-            imbalance_hist.append(imbalance)
-            if len(imbalance_hist) > 21:
-                imbalance_hist.pop(0)
-            imbalance_ma_5 = sum(imbalance_hist[-5:]) / len(imbalance_hist[-5:])
-            imbalance_ma_20 = sum(imbalance_hist[-20:]) / len(imbalance_hist[-20:])
-
-            mid_hist.append(mid)
-            if len(mid_hist) > 6:
-                mid_hist.pop(0)
-            momentum_5 = mid_hist[-1] - mid_hist[0] if len(mid_hist) == 6 else 0.0
-
-            feats_list.append([imbalance, spread, imbalance_ma_5, imbalance_ma_20, momentum_5])
-            mid_list.append(mid)
-
-    return np.array(feats_list, dtype=np.float32), np.array(mid_list, dtype=np.float32)
+    rows = [row for row in extract_feature_rows(path) if row["instrument_id"] == 1]
+    feature_names = [
+        "imbalance",
+        "spread",
+        "imbalance_ma_5",
+        "imbalance_ma_20",
+        "momentum_5",
+    ]
+    return (
+        np.asarray(
+            [[row[name] for name in feature_names] for row in rows],
+            dtype=np.float32,
+        ),
+        np.asarray([row["mid_price"] for row in rows], dtype=np.float32),
+    )
 
 
 def run_policy(q_net, feats_arr, mid_arr, device, start, end):
@@ -131,15 +100,24 @@ def compute_metrics_from_pnls(pnls):
         return {"sharpe": 0.0, "win_rate": 0.0, "total_pnl": 0.0, "profit_factor": 0.0}
     total_pnl = sum(pnls)
     mean_pnl = total_pnl / len(pnls)
-    variance = sum((p - mean_pnl) ** 2 for p in pnls) / len(pnls) if len(pnls) > 1 else 0.0
-    std_pnl = variance ** 0.5
+    variance = (
+        sum((p - mean_pnl) ** 2 for p in pnls) / len(pnls) if len(pnls) > 1 else 0.0
+    )
+    std_pnl = variance**0.5
     sharpe = (mean_pnl / std_pnl) if std_pnl > 0 else 0.0
     nonzero = [p for p in pnls if p != 0]
     win_rate = (sum(1 for p in nonzero if p > 0) / len(nonzero)) if nonzero else 0.0
     gains = sum(p for p in pnls if p > 0)
     losses = -sum(p for p in pnls if p < 0)
-    profit_factor = (gains / losses) if losses > 0 else (float("inf") if gains > 0 else 0.0)
-    return {"sharpe": sharpe, "win_rate": win_rate, "total_pnl": total_pnl, "profit_factor": profit_factor}
+    profit_factor = (
+        (gains / losses) if losses > 0 else (float("inf") if gains > 0 else 0.0)
+    )
+    return {
+        "sharpe": sharpe,
+        "win_rate": win_rate,
+        "total_pnl": total_pnl,
+        "profit_factor": profit_factor,
+    }
 
 
 def segments_from_position_log(position_log):
@@ -160,7 +138,9 @@ def segments_from_position_log(position_log):
     return segments
 
 
-def permutation_test_dqn(position_log, mid_arr, start, n_permutations=N_PERMUTATIONS, seed=42):
+def permutation_test_dqn(
+    position_log, mid_arr, start, n_permutations=N_PERMUTATIONS, seed=42
+):
     """Сохраняет ТЕ ЖЕ моменты смены позиции (ту же частоту сделок, ту же
     суммарную комиссию), но случайно перемешивает ЗНАК каждого отрезка
     удержания (LONG <-> SHORT). FLAT-отрезки (position=0) не трогаем.
@@ -168,7 +148,9 @@ def permutation_test_dqn(position_log, mid_arr, start, n_permutations=N_PERMUTAT
     её с артефактом частоты транзакций."""
     segments = segments_from_position_log(position_log)
     # число смен позиции идентично во всех перестановках -> комиссия постоянна
-    n_transitions = sum(1 for i in range(1, len(segments)) if segments[i][2] != segments[i-1][2])
+    n_transitions = sum(
+        1 for i in range(1, len(segments)) if segments[i][2] != segments[i - 1][2]
+    )
     fixed_transaction_cost = n_transitions * TRANSACTION_COST
 
     def market_pnl_for_segments(segs):
@@ -202,8 +184,13 @@ def permutation_test_dqn(position_log, mid_arr, start, n_permutations=N_PERMUTAT
     n_extreme = sum(1 for t in random_totals if abs(t) >= abs(real_total))
     p_value = n_extreme / n_permutations
     random_mean = sum(random_totals) / len(random_totals)
-    return {"real_total": real_total, "random_mean": random_mean, "p_value": p_value,
-            "n_segments": len(segments), "n_transitions": n_transitions}
+    return {
+        "real_total": real_total,
+        "random_mean": random_mean,
+        "p_value": p_value,
+        "n_segments": len(segments),
+        "n_transitions": n_transitions,
+    }
 
 
 def main():
@@ -231,29 +218,41 @@ def main():
 
     full_pnls, full_positions = run_policy(q_net, feats_arr, mid_arr, device, 0, n)
     full_metrics = compute_metrics_from_pnls(full_pnls)
-    print(f"\n=== Полная оценка (весь test-сегмент) ===")
-    print(f"total_pnl: {full_metrics['total_pnl']:.2f}  sharpe: {full_metrics['sharpe']:.3f}  "
-          f"profit_factor: {full_metrics['profit_factor']:.3f}  win_rate: {full_metrics['win_rate']:.1%}")
+    print("\n=== Полная оценка (весь test-сегмент) ===")
+    print(
+        f"total_pnl: {full_metrics['total_pnl']:.2f}  sharpe: {full_metrics['sharpe']:.3f}  "
+        f"profit_factor: {full_metrics['profit_factor']:.3f}  win_rate: {full_metrics['win_rate']:.1%}"
+    )
 
-    print(f"\n=== Walk-forward ({N_WALKFORWARD_FOLDS} последовательных окон) ===")
-    fold_size = n // N_WALKFORWARD_FOLDS
+    print(
+        f"\n=== Chronological fold evaluation ({N_CHRONOLOGICAL_FOLDS} последовательных окон) ==="
+    )
+    fold_size = n // N_CHRONOLOGICAL_FOLDS
     fold_sharpes = []
-    for fold in range(N_WALKFORWARD_FOLDS):
+    for fold in range(N_CHRONOLOGICAL_FOLDS):
         start = fold * fold_size
-        end = n if fold == N_WALKFORWARD_FOLDS - 1 else (fold + 1) * fold_size
+        end = n if fold == N_CHRONOLOGICAL_FOLDS - 1 else (fold + 1) * fold_size
         pnls, _ = run_policy(q_net, feats_arr, mid_arr, device, start, end)
         m = compute_metrics_from_pnls(pnls)
         fold_sharpes.append(m["sharpe"])
-        print(f"  Fold {fold}: range=[{start}:{end}] total_pnl={m['total_pnl']:.2f} "
-              f"sharpe={m['sharpe']:.4f} win_rate={m['win_rate']:.1%}")
+        print(
+            f"  Fold {fold}: range=[{start}:{end}] total_pnl={m['total_pnl']:.2f} "
+            f"sharpe={m['sharpe']:.4f} win_rate={m['win_rate']:.1%}"
+        )
     mean_sharpe = sum(fold_sharpes) / len(fold_sharpes)
     positive_folds = sum(1 for s in fold_sharpes if s > 0)
     print(f"Средний Sharpe по фолдам: {mean_sharpe:.4f}")
-    print(f"Положительных фолдов: {positive_folds}/{N_WALKFORWARD_FOLDS}")
+    print(f"Положительных фолдов: {positive_folds}/{N_CHRONOLOGICAL_FOLDS}")
 
-    print(f"\n=== Permutation test ({N_PERMUTATIONS} перестановок, знак сделок при фикс. частоте) ===")
-    pt = permutation_test_dqn(full_positions, mid_arr, start=0, n_permutations=N_PERMUTATIONS)
-    print(f"Число отрезков позиции: {pt['n_segments']}, транзакций: {pt['n_transitions']}")
+    print(
+        f"\n=== Permutation test ({N_PERMUTATIONS} перестановок, знак сделок при фикс. частоте) ==="
+    )
+    pt = permutation_test_dqn(
+        full_positions, mid_arr, start=0, n_permutations=N_PERMUTATIONS
+    )
+    print(
+        f"Число отрезков позиции: {pt['n_segments']}, транзакций: {pt['n_transitions']}"
+    )
     print(f"Реальный total PnL:  {pt['real_total']:.2f}")
     print(f"Случайный mean PnL:  {pt['random_mean']:.2f}")
     print(f"p-value:             {pt['p_value']:.4f}")

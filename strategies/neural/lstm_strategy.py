@@ -1,21 +1,9 @@
 import json
 from collections import deque
 import torch
-import torch.nn as nn
 import back_tester as bt
 from strategies.common.base_mixin import TrackingMixin
-
-
-class LSTM(nn.Module):
-    def __init__(self, n_features, hidden_size=32, num_layers=1):
-        super().__init__()
-        self.lstm = nn.LSTM(n_features, hidden_size, num_layers, batch_first=True)
-        self.head = nn.Linear(hidden_size, 1)
-
-    def forward(self, x):
-        out, (h_n, c_n) = self.lstm(x)
-        last = out[:, -1, :]
-        return self.head(last).squeeze(-1)
+from strategies.neural.models import LSTM
 
 
 class LSTMStrategy(TrackingMixin, bt.Strategy):
@@ -27,9 +15,16 @@ class LSTMStrategy(TrackingMixin, bt.Strategy):
     PRICE_SCALE = 1_000_000_000
     WINDOW = 20
 
-    def __init__(self, instrument_ids, model_path="ml/lstm_model.pt",
-                 scaler_path="ml/lstm_scaler.json",
-                 prob_threshold=0.52, confirmation_steps=3, min_hold_updates=15, order_size=1):
+    def __init__(
+        self,
+        instrument_ids,
+        model_path="ml/lstm_model.pt",
+        scaler_path="ml/lstm_scaler.json",
+        prob_threshold=0.52,
+        confirmation_steps=3,
+        min_hold_updates=15,
+        order_size=1,
+    ):
         super().__init__()
         self._init_tracking(instrument_ids)
 
@@ -123,10 +118,14 @@ class LSTMStrategy(TrackingMixin, bt.Strategy):
         direction = self.streak_direction[instrument_id]
 
         if direction == 1 and current_position <= 0 and can_flip:
-            self.submit_limit(instrument_id, bt.Side.BUY, best_ask_price, self.order_size)
+            self.submit_limit(
+                instrument_id, bt.Side.BUY, best_ask_price, self.order_size
+            )
             self.orders_sent += 1
             self.updates_since_entry[instrument_id] = 0
         elif direction == -1 and current_position >= 0 and can_flip:
-            self.submit_limit(instrument_id, bt.Side.SELL, best_bid_price, self.order_size)
+            self.submit_limit(
+                instrument_id, bt.Side.SELL, best_bid_price, self.order_size
+            )
             self.orders_sent += 1
             self.updates_since_entry[instrument_id] = 0

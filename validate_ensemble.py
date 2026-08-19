@@ -1,5 +1,5 @@
 """
-Честная валидация voting ensemble (LogReg+LightGBM+MLP+TCN): walk-forward
+Честная валидация voting ensemble (LogReg+LightGBM+MLP+TCN): chronological fold evaluation
 (5 последовательных окон) + permutation test.
 
 ФИКС v3: фильтруем dataset только по instrument_id==1 — feature_extraction.py
@@ -11,97 +11,53 @@ sharpe≈0 и win_rate≈50% на каждом фолде в предыдуще�
     uv run python3 validate_ensemble.py --data synthetic_signal_slow_test.jsonl
     uv run python3 validate_ensemble.py --data synthetic_signal_slow_test.jsonl --no-filter
 """
+
 from __future__ import annotations
 
 import argparse
 import json
 import random
-import sys
 from collections import deque
 from dataclasses import dataclass
 
 import numpy as np
 import torch
-import torch.nn as nn
 import lightgbm as lgb
 
-sys.path.insert(0, "research_pipeline/ml")
-from feature_extraction import replay_and_extract_features  # noqa: E402
+from research_pipeline.ml.feature_extraction import replay_and_extract_features
+from strategies.neural.models import MLP, TCN
 
 TRANSACTION_COST = 0.5
-N_WALKFORWARD_FOLDS = 5
+N_CHRONOLOGICAL_FOLDS = 5
 N_PERMUTATIONS = 100
 MODEL_DIR = "research_pipeline/ml"
 
 CONFIRMATION_STEPS = 3
 MIN_HOLD_UPDATES = 15
 
-LOGREG_FEATURES = ["imbalance", "spread", "imbalance_ma_5", "imbalance_ma_20",
-                    "momentum_5", "momentum_20", "volatility_20", "bid_qty",
-                    "ask_qty", "trade_freq_20"]
-LGB_MLP_FEATURES = ["imbalance", "spread", "imbalance_ma_5", "imbalance_ma_20",
-                     "momentum_5", "bid_qty", "ask_qty"]
+LOGREG_FEATURES = [
+    "imbalance",
+    "spread",
+    "imbalance_ma_5",
+    "imbalance_ma_20",
+    "momentum_5",
+    "momentum_20",
+    "volatility_20",
+    "bid_qty",
+    "ask_qty",
+    "trade_freq_20",
+]
+LGB_MLP_FEATURES = [
+    "imbalance",
+    "spread",
+    "imbalance_ma_5",
+    "imbalance_ma_20",
+    "momentum_5",
+    "bid_qty",
+    "ask_qty",
+]
 TCN_RAW_FEATURES = ["imbalance", "spread", "bid_qty", "ask_qty"]
 TCN_WINDOW = 20
-
-
-class MLP(nn.Module):
-    def __init__(self, n_features):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(n_features, 64), nn.ReLU(),
-            nn.Linear(64, 32), nn.ReLU(),
-            nn.Linear(32, 1),
-        )
-
-    def forward(self, x):
-        return self.net(x).squeeze(-1)
-
-
-class CausalConv1d(nn.Module):
-    def __init__(self, in_ch, out_ch, kernel_size, dilation):
-        super().__init__()
-        self.pad = (kernel_size - 1) * dilation
-        self.conv = nn.Conv1d(in_ch, out_ch, kernel_size, padding=self.pad, dilation=dilation)
-
-    def forward(self, x):
-        out = self.conv(x)
-        return out[:, :, :-self.pad] if self.pad > 0 else out
-
-
-class TCNBlock(nn.Module):
-    def __init__(self, in_ch, out_ch, kernel_size, dilation):
-        super().__init__()
-        self.conv1 = CausalConv1d(in_ch, out_ch, kernel_size, dilation)
-        self.relu1 = nn.ReLU()
-        self.conv2 = CausalConv1d(out_ch, out_ch, kernel_size, dilation)
-        self.relu2 = nn.ReLU()
-        self.downsample = nn.Conv1d(in_ch, out_ch, 1) if in_ch != out_ch else None
-
-    def forward(self, x):
-        out = self.relu1(self.conv1(x))
-        out = self.relu2(self.conv2(out))
-        res = x if self.downsample is None else self.downsample(x)
-        return out + res
-
-
-class TCN(nn.Module):
-    def __init__(self, n_features, channels=(32, 32, 32), kernel_size=3):
-        super().__init__()
-        layers = []
-        in_ch = n_features
-        for i, out_ch in enumerate(channels):
-            dilation = 2 ** i
-            layers.append(TCNBlock(in_ch, out_ch, kernel_size, dilation))
-            in_ch = out_ch
-        self.tcn = nn.Sequential(*layers)
-        self.head = nn.Linear(in_ch, 1)
-
-    def forward(self, x):
-        x = x.transpose(1, 2)
-        out = self.tcn(x)
-        last = out[:, :, -1]
-        return self.head(last).squeeze(-1)
 
 
 @dataclass
@@ -130,21 +86,32 @@ def load_ensemble() -> Ensemble:
     with open(f"{MODEL_DIR}/mlp_scaler.json") as f:
         mlp_scaler = json.load(f)
     mlp_model = MLP(len(LGB_MLP_FEATURES))
-    mlp_model.load_state_dict(torch.load(f"{MODEL_DIR}/mlp_model.pt", map_location="cpu"))
+    mlp_model.load_state_dict(
+        torch.load(f"{MODEL_DIR}/mlp_model.pt", map_location="cpu")
+    )
     mlp_model.eval()
     with open(f"{MODEL_DIR}/tcn_scaler.json") as f:
         tcn_scaler = json.load(f)
     tcn_model = TCN(n_features=len(tcn_scaler["mean"]))
-    tcn_model.load_state_dict(torch.load(f"{MODEL_DIR}/tcn_model.pt", map_location="cpu"))
+    tcn_model.load_state_dict(
+        torch.load(f"{MODEL_DIR}/tcn_model.pt", map_location="cpu")
+    )
     tcn_model.eval()
 
     return Ensemble(
-        logreg_coef=np.array(logreg_meta["coef"]), logreg_intercept=logreg_meta["intercept"],
-        logreg_acc=logreg_meta["test_acc"], lgb_model=lgb_model, lgb_acc=lgb_meta["test_acc"],
-        mlp_model=mlp_model, mlp_mean=torch.tensor(mlp_scaler["mean"], dtype=torch.float32),
-        mlp_std=torch.tensor(mlp_scaler["std"], dtype=torch.float32), mlp_acc=mlp_scaler["test_acc"],
-        tcn_model=tcn_model, tcn_mean=torch.tensor(tcn_scaler["mean"], dtype=torch.float32),
-        tcn_std=torch.tensor(tcn_scaler["std"], dtype=torch.float32), tcn_acc=tcn_scaler["test_acc"],
+        logreg_coef=np.array(logreg_meta["coef"]),
+        logreg_intercept=logreg_meta["intercept"],
+        logreg_acc=logreg_meta["test_acc"],
+        lgb_model=lgb_model,
+        lgb_acc=lgb_meta["test_acc"],
+        mlp_model=mlp_model,
+        mlp_mean=torch.tensor(mlp_scaler["mean"], dtype=torch.float32),
+        mlp_std=torch.tensor(mlp_scaler["std"], dtype=torch.float32),
+        mlp_acc=mlp_scaler["test_acc"],
+        tcn_model=tcn_model,
+        tcn_mean=torch.tensor(tcn_scaler["mean"], dtype=torch.float32),
+        tcn_std=torch.tensor(tcn_scaler["std"], dtype=torch.float32),
+        tcn_acc=tcn_scaler["test_acc"],
     )
 
 
@@ -198,7 +165,9 @@ def get_decisions_and_prices(ens, weights, dataset):
         p_mlp = predict_mlp(ens, row)
 
         mid_price = row["mid_price"]
-        mid_price_delta = (mid_price - mid_price_prev) if mid_price_prev is not None else 0.0
+        mid_price_delta = (
+            (mid_price - mid_price_prev) if mid_price_prev is not None else 0.0
+        )
         mid_price_prev = mid_price
         raw_feat = [row[c] for c in TCN_RAW_FEATURES] + [mid_price_delta]
         tcn_window.append(raw_feat)
@@ -217,8 +186,9 @@ DECISION_TO_POSITION = {"LONG": 1, "SHORT": -1, "FLAT": 0}
 POSITION_TO_DECISION = {1: "LONG", -1: "SHORT", 0: "FLAT"}
 
 
-def apply_confirmation_and_hold(decisions, confirmation_steps=CONFIRMATION_STEPS,
-                                 min_hold_updates=MIN_HOLD_UPDATES):
+def apply_confirmation_and_hold(
+    decisions, confirmation_steps=CONFIRMATION_STEPS, min_hold_updates=MIN_HOLD_UPDATES
+):
     filtered = []
     position = 0
     pending_target = None
@@ -274,15 +244,24 @@ def compute_metrics_from_pnls(pnls):
         return {"sharpe": 0.0, "win_rate": 0.0, "total_pnl": 0.0, "profit_factor": 0.0}
     total_pnl = sum(pnls)
     mean_pnl = total_pnl / len(pnls)
-    variance = sum((p - mean_pnl) ** 2 for p in pnls) / len(pnls) if len(pnls) > 1 else 0.0
-    std_pnl = variance ** 0.5
+    variance = (
+        sum((p - mean_pnl) ** 2 for p in pnls) / len(pnls) if len(pnls) > 1 else 0.0
+    )
+    std_pnl = variance**0.5
     sharpe = (mean_pnl / std_pnl) if std_pnl > 0 else 0.0
     nonzero = [p for p in pnls if p != 0]
     win_rate = (sum(1 for p in nonzero if p > 0) / len(nonzero)) if nonzero else 0.0
     gains = sum(p for p in pnls if p > 0)
     losses = -sum(p for p in pnls if p < 0)
-    profit_factor = (gains / losses) if losses > 0 else (float("inf") if gains > 0 else 0.0)
-    return {"sharpe": sharpe, "win_rate": win_rate, "total_pnl": total_pnl, "profit_factor": profit_factor}
+    profit_factor = (
+        (gains / losses) if losses > 0 else (float("inf") if gains > 0 else 0.0)
+    )
+    return {
+        "sharpe": sharpe,
+        "win_rate": win_rate,
+        "total_pnl": total_pnl,
+        "profit_factor": profit_factor,
+    }
 
 
 def segments_from_decisions(decisions):
@@ -300,9 +279,13 @@ def segments_from_decisions(decisions):
     return segments
 
 
-def permutation_test_ensemble(decisions, mid_prices, n_permutations=N_PERMUTATIONS, seed=42):
+def permutation_test_ensemble(
+    decisions, mid_prices, n_permutations=N_PERMUTATIONS, seed=42
+):
     segments = segments_from_decisions(decisions)
-    n_transitions = sum(1 for i in range(1, len(segments)) if segments[i][2] != segments[i-1][2])
+    n_transitions = sum(
+        1 for i in range(1, len(segments)) if segments[i][2] != segments[i - 1][2]
+    )
     fixed_cost = n_transitions * TRANSACTION_COST
 
     def market_pnl(segs):
@@ -332,8 +315,12 @@ def permutation_test_ensemble(decisions, mid_prices, n_permutations=N_PERMUTATIO
     n_extreme = sum(1 for t in random_totals if abs(t) >= abs(real_total))
     p_value = n_extreme / n_permutations
     random_mean = sum(random_totals) / len(random_totals)
-    return {"real_total": real_total, "random_mean": random_mean, "p_value": p_value,
-            "n_transitions": n_transitions}
+    return {
+        "real_total": real_total,
+        "random_mean": random_mean,
+        "p_value": p_value,
+        "n_transitions": n_transitions,
+    }
 
 
 def main():
@@ -342,17 +329,28 @@ def main():
     ap.add_argument("--no-filter", action="store_true")
     ap.add_argument("--confirmation-steps", type=int, default=CONFIRMATION_STEPS)
     ap.add_argument("--min-hold-updates", type=int, default=MIN_HOLD_UPDATES)
-    ap.add_argument("--instrument-id", type=int, default=1,
-                     help="фильтровать датасет только по этому инструменту "
-                          "(feature_extraction.py не разделяет инструменты сам)")
+    ap.add_argument(
+        "--instrument-id",
+        type=int,
+        default=1,
+        help="фильтровать датасет только по этому инструменту "
+        "(feature_extraction.py не разделяет инструменты сам)",
+    )
     args = ap.parse_args()
 
     print("Загружаю модели (LogReg, LightGBM, MLP, TCN)...")
     ens = load_ensemble()
-    weights = {"logreg": ens.logreg_acc, "lgb": ens.lgb_acc, "mlp": ens.mlp_acc, "tcn": ens.tcn_acc}
+    weights = {
+        "logreg": ens.logreg_acc,
+        "lgb": ens.lgb_acc,
+        "mlp": ens.mlp_acc,
+        "tcn": ens.tcn_acc,
+    }
 
     print(f"Данные: {args.data} — извлечение фичей...")
-    dataset_all = replay_and_extract_features(args.data, horizon=20, imbalance_windows=(5, 20))
+    dataset_all = replay_and_extract_features(
+        args.data, horizon=20, imbalance_windows=(5, 20)
+    )
     print(f"Всего наблюдений (все инструменты): {len(dataset_all)}")
     dataset = [row for row in dataset_all if row["instrument_id"] == args.instrument_id]
     n = len(dataset)
@@ -363,42 +361,62 @@ def main():
 
     if args.no_filter:
         decisions = raw_decisions
-        print("Фильтр confirmation/hold ОТКЛЮЧЕН (--no-filter) — сырые решения на каждом баре.")
+        print(
+            "Фильтр confirmation/hold ОТКЛЮЧЕН (--no-filter) — сырые решения на каждом баре."
+        )
     else:
         decisions = apply_confirmation_and_hold(
             raw_decisions,
             confirmation_steps=args.confirmation_steps,
             min_hold_updates=args.min_hold_updates,
         )
-        n_raw_changes = sum(1 for i in range(1, len(raw_decisions)) if raw_decisions[i] != raw_decisions[i-1])
-        n_filtered_changes = sum(1 for i in range(1, len(decisions)) if decisions[i] != decisions[i-1])
-        print(f"Фильтр: confirmation_steps={args.confirmation_steps}, "
-              f"min_hold_updates={args.min_hold_updates}")
-        print(f"Смен решения: сырых={n_raw_changes} -> после фильтра={n_filtered_changes}")
+        n_raw_changes = sum(
+            1
+            for i in range(1, len(raw_decisions))
+            if raw_decisions[i] != raw_decisions[i - 1]
+        )
+        n_filtered_changes = sum(
+            1 for i in range(1, len(decisions)) if decisions[i] != decisions[i - 1]
+        )
+        print(
+            f"Фильтр: confirmation_steps={args.confirmation_steps}, "
+            f"min_hold_updates={args.min_hold_updates}"
+        )
+        print(
+            f"Смен решения: сырых={n_raw_changes} -> после фильтра={n_filtered_changes}"
+        )
 
     full_pnls = compute_pnl(decisions, mid_prices, 0, n)
     full_metrics = compute_metrics_from_pnls(full_pnls)
-    print(f"\n=== Полная оценка ===")
-    print(f"total_pnl: {full_metrics['total_pnl']:.2f}  sharpe: {full_metrics['sharpe']:.3f}  "
-          f"profit_factor: {full_metrics['profit_factor']:.3f}  win_rate: {full_metrics['win_rate']:.1%}")
+    print("\n=== Полная оценка ===")
+    print(
+        f"total_pnl: {full_metrics['total_pnl']:.2f}  sharpe: {full_metrics['sharpe']:.3f}  "
+        f"profit_factor: {full_metrics['profit_factor']:.3f}  win_rate: {full_metrics['win_rate']:.1%}"
+    )
 
-    print(f"\n=== Walk-forward ({N_WALKFORWARD_FOLDS} последовательных окон) ===")
-    fold_size = n // N_WALKFORWARD_FOLDS
+    print(
+        f"\n=== Chronological fold evaluation ({N_CHRONOLOGICAL_FOLDS} последовательных окон) ==="
+    )
+    fold_size = n // N_CHRONOLOGICAL_FOLDS
     fold_sharpes = []
-    for fold in range(N_WALKFORWARD_FOLDS):
+    for fold in range(N_CHRONOLOGICAL_FOLDS):
         start = fold * fold_size
-        end = n if fold == N_WALKFORWARD_FOLDS - 1 else (fold + 1) * fold_size
+        end = n if fold == N_CHRONOLOGICAL_FOLDS - 1 else (fold + 1) * fold_size
         pnls = compute_pnl(decisions, mid_prices, start, end)
         m = compute_metrics_from_pnls(pnls)
         fold_sharpes.append(m["sharpe"])
-        print(f"  Fold {fold}: range=[{start}:{end}] total_pnl={m['total_pnl']:.2f} "
-              f"sharpe={m['sharpe']:.4f} win_rate={m['win_rate']:.1%}")
+        print(
+            f"  Fold {fold}: range=[{start}:{end}] total_pnl={m['total_pnl']:.2f} "
+            f"sharpe={m['sharpe']:.4f} win_rate={m['win_rate']:.1%}"
+        )
     mean_sharpe = sum(fold_sharpes) / len(fold_sharpes)
     positive_folds = sum(1 for s in fold_sharpes if s > 0)
     print(f"Средний Sharpe по фолдам: {mean_sharpe:.4f}")
-    print(f"Положительных фолдов: {positive_folds}/{N_WALKFORWARD_FOLDS}")
+    print(f"Положительных фолдов: {positive_folds}/{N_CHRONOLOGICAL_FOLDS}")
 
-    print(f"\n=== Permutation test ({N_PERMUTATIONS} перестановок, знак при фикс. частоте) ===")
+    print(
+        f"\n=== Permutation test ({N_PERMUTATIONS} перестановок, знак при фикс. частоте) ==="
+    )
     pt = permutation_test_ensemble(decisions, mid_prices, n_permutations=N_PERMUTATIONS)
     print(f"Транзакций: {pt['n_transitions']}")
     print(f"Реальный total PnL:  {pt['real_total']:.2f}")

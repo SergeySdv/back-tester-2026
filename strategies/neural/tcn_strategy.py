@@ -1,55 +1,9 @@
 import json
 from collections import deque
 import torch
-import torch.nn as nn
 import back_tester as bt
 from strategies.common.base_mixin import TrackingMixin
-
-
-class CausalConv1d(nn.Module):
-    def __init__(self, in_ch, out_ch, kernel_size, dilation):
-        super().__init__()
-        self.pad = (kernel_size - 1) * dilation
-        self.conv = nn.Conv1d(in_ch, out_ch, kernel_size, padding=self.pad, dilation=dilation)
-
-    def forward(self, x):
-        out = self.conv(x)
-        return out[:, :, :-self.pad] if self.pad > 0 else out
-
-
-class TCNBlock(nn.Module):
-    def __init__(self, in_ch, out_ch, kernel_size, dilation):
-        super().__init__()
-        self.conv1 = CausalConv1d(in_ch, out_ch, kernel_size, dilation)
-        self.relu1 = nn.ReLU()
-        self.conv2 = CausalConv1d(out_ch, out_ch, kernel_size, dilation)
-        self.relu2 = nn.ReLU()
-        self.downsample = nn.Conv1d(in_ch, out_ch, 1) if in_ch != out_ch else None
-
-    def forward(self, x):
-        out = self.relu1(self.conv1(x))
-        out = self.relu2(self.conv2(out))
-        res = x if self.downsample is None else self.downsample(x)
-        return out + res
-
-
-class TCN(nn.Module):
-    def __init__(self, n_features, channels=(32, 32, 32), kernel_size=3):
-        super().__init__()
-        layers = []
-        in_ch = n_features
-        for i, out_ch in enumerate(channels):
-            dilation = 2 ** i
-            layers.append(TCNBlock(in_ch, out_ch, kernel_size, dilation))
-            in_ch = out_ch
-        self.tcn = nn.Sequential(*layers)
-        self.head = nn.Linear(in_ch, 1)
-
-    def forward(self, x):
-        x = x.transpose(1, 2)
-        out = self.tcn(x)
-        last = out[:, :, -1]
-        return self.head(last).squeeze(-1)
+from strategies.neural.models import TCN
 
 
 class TCNStrategy(TrackingMixin, bt.Strategy):
@@ -61,9 +15,16 @@ class TCNStrategy(TrackingMixin, bt.Strategy):
     PRICE_SCALE = 1_000_000_000
     WINDOW = 20
 
-    def __init__(self, instrument_ids, model_path="my_scripts/ml/tcn_model.pt",
-                 scaler_path="my_scripts/ml/tcn_scaler.json",
-                 prob_threshold=0.52, confirmation_steps=3, min_hold_updates=15, order_size=1):
+    def __init__(
+        self,
+        instrument_ids,
+        model_path="my_scripts/ml/tcn_model.pt",
+        scaler_path="my_scripts/ml/tcn_scaler.json",
+        prob_threshold=0.52,
+        confirmation_steps=3,
+        min_hold_updates=15,
+        order_size=1,
+    ):
         super().__init__()
         self._init_tracking(instrument_ids)
 
@@ -125,7 +86,9 @@ class TCNStrategy(TrackingMixin, bt.Strategy):
         if len(window) < self.WINDOW:
             return
 
-        seq = torch.tensor(list(window), dtype=torch.float32).unsqueeze(0)  # (1, window, 5)
+        seq = torch.tensor(list(window), dtype=torch.float32).unsqueeze(
+            0
+        )  # (1, window, 5)
         seq_norm = (seq - self.mean) / self.std
 
         with torch.no_grad():
@@ -157,10 +120,14 @@ class TCNStrategy(TrackingMixin, bt.Strategy):
         direction = self.streak_direction[instrument_id]
 
         if direction == 1 and current_position <= 0 and can_flip:
-            self.submit_limit(instrument_id, bt.Side.BUY, best_ask_price, self.order_size)
+            self.submit_limit(
+                instrument_id, bt.Side.BUY, best_ask_price, self.order_size
+            )
             self.orders_sent += 1
             self.updates_since_entry[instrument_id] = 0
         elif direction == -1 and current_position >= 0 and can_flip:
-            self.submit_limit(instrument_id, bt.Side.SELL, best_bid_price, self.order_size)
+            self.submit_limit(
+                instrument_id, bt.Side.SELL, best_bid_price, self.order_size
+            )
             self.orders_sent += 1
             self.updates_since_entry[instrument_id] = 0

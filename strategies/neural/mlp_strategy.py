@@ -1,22 +1,9 @@
 import json
 from collections import deque
 import torch
-import torch.nn as nn
 import back_tester as bt
 from strategies.common.base_mixin import TrackingMixin
-
-
-class MLP(nn.Module):
-    def __init__(self, n_features):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(n_features, 64), nn.ReLU(),
-            nn.Linear(64, 32), nn.ReLU(),
-            nn.Linear(32, 1),
-        )
-
-    def forward(self, x):
-        return self.net(x).squeeze(-1)
+from strategies.neural.models import MLP
 
 
 class MLPStrategy(TrackingMixin, bt.Strategy):
@@ -25,12 +12,26 @@ class MLPStrategy(TrackingMixin, bt.Strategy):
 
     NAME = "mlp"
     PRICE_SCALE = 1_000_000_000
-    FEATURE_NAMES = ["imbalance", "spread", "imbalance_ma_5", "imbalance_ma_20",
-                      "momentum_5", "bid_qty", "ask_qty"]
+    FEATURE_NAMES = [
+        "imbalance",
+        "spread",
+        "imbalance_ma_5",
+        "imbalance_ma_20",
+        "momentum_5",
+        "bid_qty",
+        "ask_qty",
+    ]
 
-    def __init__(self, instrument_ids, model_path="my_scripts/ml/mlp_model.pt",
-                 scaler_path="my_scripts/ml/mlp_scaler.json",
-                 prob_threshold=0.52, confirmation_steps=3, min_hold_updates=15, order_size=1):
+    def __init__(
+        self,
+        instrument_ids,
+        model_path="my_scripts/ml/mlp_model.pt",
+        scaler_path="my_scripts/ml/mlp_scaler.json",
+        prob_threshold=0.52,
+        confirmation_steps=3,
+        min_hold_updates=15,
+        order_size=1,
+    ):
         super().__init__()
         self._init_tracking(instrument_ids)
 
@@ -92,8 +93,18 @@ class MLPStrategy(TrackingMixin, bt.Strategy):
         else:
             momentum_5 = 0.0
 
-        feats = torch.tensor([imbalance, spread, imbalance_ma_5, imbalance_ma_20,
-                               momentum_5, bid_qty, ask_qty], dtype=torch.float32)
+        feats = torch.tensor(
+            [
+                imbalance,
+                spread,
+                imbalance_ma_5,
+                imbalance_ma_20,
+                momentum_5,
+                bid_qty,
+                ask_qty,
+            ],
+            dtype=torch.float32,
+        )
         feats_norm = (feats - self.mean) / self.std
 
         with torch.no_grad():
@@ -130,10 +141,14 @@ class MLPStrategy(TrackingMixin, bt.Strategy):
         direction = self.streak_direction[instrument_id]
 
         if direction == 1 and current_position <= 0 and can_flip:
-            self.submit_limit(instrument_id, bt.Side.BUY, best_ask_price, self.order_size)
+            self.submit_limit(
+                instrument_id, bt.Side.BUY, best_ask_price, self.order_size
+            )
             self.orders_sent += 1
             self.updates_since_entry[instrument_id] = 0
         elif direction == -1 and current_position >= 0 and can_flip:
-            self.submit_limit(instrument_id, bt.Side.SELL, best_bid_price, self.order_size)
+            self.submit_limit(
+                instrument_id, bt.Side.SELL, best_bid_price, self.order_size
+            )
             self.orders_sent += 1
             self.updates_since_entry[instrument_id] = 0

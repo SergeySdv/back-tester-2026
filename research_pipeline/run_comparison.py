@@ -1,50 +1,27 @@
 import argparse
-import sys
 import os
+import sys
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root, для strategies/
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import back_tester as bt
 import pandas as pd
 
 from metrics import compute_metrics
-from strategies.rule_based.imbalance import ImbalanceStrategy
-from strategies.rule_based.momentum import MomentumStrategy
-from strategies.rule_based.mean_reversion import MeanReversionStrategy
-from strategies.rule_based.imbalance_confirmed import ImbalanceConfirmedStrategy
-from strategies.ml.ml_logistic import MLLogisticStrategy
-from strategies.ml.lightgbm_strategy import LightGBMStrategy
-from strategies.neural.mlp_strategy import MLPStrategy
-from strategies.neural.tcn_strategy import TCNStrategy
-from strategies.meta.ensemble_strategy import VotingEnsembleStrategy
-from strategies.rl.dqn_strategy import DQNStrategy
-from strategies.neural.lstm_strategy import LSTMStrategy
+from strategy_registry import STRATEGIES, available_strategy_names, build_strategy
+
 
 INSTRUMENT_IDS = [1, 2]
 INSTRUMENTS = [
     bt.InstrumentMeta(instrument_id=1, contract_multiplier=10),
     bt.InstrumentMeta(instrument_id=2, contract_multiplier=5),
 ]
-
-STRATEGY_FACTORIES = {
-    "imbalance": lambda: ImbalanceStrategy(INSTRUMENT_IDS, threshold=0.3, order_size=1),
-    "momentum": lambda: MomentumStrategy(INSTRUMENT_IDS, lookback=5, order_size=1),
-    "mean_reversion": lambda: MeanReversionStrategy(INSTRUMENT_IDS, lookback=10, threshold_ticks=2, order_size=1),
-    "imbalance_confirmed": lambda: ImbalanceConfirmedStrategy(INSTRUMENT_IDS, threshold=0.3, confirmation_steps=3, min_hold_updates=15, order_size=1),
-    "ml_logistic": lambda: MLLogisticStrategy(INSTRUMENT_IDS, prob_threshold=0.52, confirmation_steps=3, min_hold_updates=15, order_size=1),
-    "lightgbm": lambda: LightGBMStrategy(INSTRUMENT_IDS, prob_threshold=0.52, confirmation_steps=3, min_hold_updates=15, order_size=1),
-    "mlp": lambda: MLPStrategy(INSTRUMENT_IDS, prob_threshold=0.52, confirmation_steps=3, min_hold_updates=15, order_size=1),
-    "tcn": lambda: TCNStrategy(INSTRUMENT_IDS, prob_threshold=0.52, confirmation_steps=3, min_hold_updates=15, order_size=1),
-    "ensemble_voting": lambda: VotingEnsembleStrategy(INSTRUMENT_IDS, prob_threshold=0.52, confirmation_steps=3, min_hold_updates=15, order_size=1),
-    "dqn": lambda: DQNStrategy(INSTRUMENT_IDS, order_size=1),
-    "lstm": lambda: LSTMStrategy(INSTRUMENT_IDS, prob_threshold=0.52, confirmation_steps=3, min_hold_updates=15, order_size=1),
-}
-
 BOOK_DEPTH = 1
 
 
-def run_one(name, factory, data_path):
-    strategy = factory()
+def run_one(name, data_path):
+    strategy = build_strategy(name, INSTRUMENT_IDS)
     result = bt.backtest.run(
         strategy,
         data_path,
@@ -59,62 +36,96 @@ def run_one(name, factory, data_path):
     return metrics
 
 
+def _print_strategy_status():
+    print("Strategies:")
+    for name, spec in STRATEGIES.items():
+        reason = spec.unavailable_reason()
+        status = "available" if reason is None else f"unavailable ({reason})"
+        print(f"  - {name}: {status}")
+
+
+def _selected_strategies(argument, parser):
+    if argument == "all":
+        selected = available_strategy_names()
+        skipped = [name for name in STRATEGIES if name not in selected]
+        if skipped:
+            print(
+                f"Skipping unavailable strategies: {', '.join(skipped)}",
+                file=sys.stderr,
+            )
+        return selected
+
+    selected = [name.strip() for name in argument.split(",") if name.strip()]
+    unknown = [name for name in selected if name not in STRATEGIES]
+    if unknown:
+        parser.error(f"unknown strategies: {', '.join(unknown)}")
+    unavailable = {
+        name: STRATEGIES[name].unavailable_reason()
+        for name in selected
+        if STRATEGIES[name].unavailable_reason() is not None
+    }
+    if unavailable:
+        details = "; ".join(f"{name}: {reason}" for name, reason in unavailable.items())
+        parser.error(f"requested strategies are unavailable: {details}")
+    return selected
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Сравнение стратегий на synthetic-данных через C++ движок")
+    parser = argparse.ArgumentParser(
+        description="Compare strategies on synthetic data through the C++ engine"
+    )
     parser.add_argument(
-        "--strategies", "-s",
-        type=str,
+        "--strategies",
+        "-s",
         default="all",
-        help=f"Через запятую: {','.join(STRATEGY_FACTORIES.keys())}. По умолчанию all — все сразу.",
+        help=f"comma-separated names: {','.join(STRATEGIES)}; default: all available",
     )
     parser.add_argument(
-        "--data", "-d",
-        type=str,
+        "--data",
+        "-d",
         default="synthetic_signal.jsonl",
-        help="Путь к JSONL-файлу с данными (по умолчанию synthetic_signal.jsonl)",
+        help="path to JSONL data",
     )
     parser.add_argument(
-        "--list", action="store_true",
-        help="Показать список доступных стратегий и выйти",
+        "--list", action="store_true", help="show strategy availability"
     )
     args = parser.parse_args()
 
     if args.list:
-        print("Доступные стратегии:")
-        for name in STRATEGY_FACTORIES:
-            print(f"  - {name}")
+        _print_strategy_status()
         return
 
-    if args.strategies == "all":
-        selected = list(STRATEGY_FACTORIES.keys())
-    else:
-        selected = [s.strip() for s in args.strategies.split(",")]
-        unknown = [s for s in selected if s not in STRATEGY_FACTORIES]
-        if unknown:
-            print(f"Неизвестные стратегии: {unknown}")
-            print(f"Доступные: {list(STRATEGY_FACTORIES.keys())}")
-            sys.exit(1)
+    selected = _selected_strategies(args.strategies, parser)
+    if not selected:
+        parser.error("no runnable strategies are available")
 
-    print(f"Данные: {args.data}")
-    print(f"Стратегии: {selected}\n")
+    print(f"Data: {args.data}")
+    print(f"Strategies: {selected}\n")
 
     rows = []
     for name in selected:
         print(f"--- Running {name} ---")
-        rows.append(run_one(name, STRATEGY_FACTORIES[name], args.data))
+        rows.append(run_one(name, args.data))
 
-    df = pd.DataFrame(rows).set_index("strategy")
-    cols = [
-        "final_pnl", "max_drawdown", "sharpe", "win_rate",
-        "num_fills", "total_volume", "profit_factor",
-        "avg_pnl_per_trade", "num_closing_trades",
-        "orders_sent", "book_updates",
+    dataframe = pd.DataFrame(rows).set_index("strategy")
+    columns = [
+        "final_pnl",
+        "max_drawdown",
+        "sharpe",
+        "win_rate",
+        "num_fills",
+        "total_volume",
+        "profit_factor",
+        "avg_pnl_per_trade",
+        "num_closing_trades",
+        "orders_sent",
+        "book_updates",
     ]
-    df = df[cols]
+    dataframe = dataframe[columns]
     pd.set_option("display.width", 200)
     pd.set_option("display.max_columns", 20)
     print(f"\n=== Comparison (book_depth={BOOK_DEPTH}) ===")
-    print(df.to_string(float_format=lambda x: f"{x:.4f}"))
+    print(dataframe.to_string(float_format=lambda value: f"{value:.4f}"))
 
 
 if __name__ == "__main__":

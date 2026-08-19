@@ -1,89 +1,70 @@
-"""Извлечение окон последовательностей для LSTM — идентично feature_extraction_tcn.py,
-чтобы вход был одинаковым для честного сравнения архитектур (TCN vs LSTM)."""
-import json
+"""Build per-instrument LSTM windows from deterministic L3 replay."""
+
+from collections import defaultdict, deque
+
 import numpy as np
+
+from research_pipeline.l3_replay import iter_book_observations
 
 
 def replay_and_extract_sequences(path, horizon=20, window=20):
-    state = {}
-    tick_history = {}
-    mid_price_prev = {}
+    tick_history = defaultdict(lambda: deque(maxlen=window))
+    previous_mid_price = {}
     sequences = []
 
-    with open(path) as f:
-        for line in f:
-            event = json.loads(line)
-            instr_id = event["hd"]["instrument_id"]
-            action = event["action"]
+    for observation in iter_book_observations(path):
+        instrument_id = observation.instrument_id
+        total = observation.bid_quantity + observation.ask_quantity
+        if total == 0:
+            continue
 
-            if instr_id not in state:
-                state[instr_id] = {"best_bid": None, "best_ask": None, "bid_qty": 0, "ask_qty": 0}
-                tick_history[instr_id] = []
-                mid_price_prev[instr_id] = None
+        imbalance = (observation.bid_quantity - observation.ask_quantity) / total
+        spread = observation.best_ask - observation.best_bid
+        mid_price = (observation.best_bid + observation.best_ask) / 2
+        previous = previous_mid_price.get(instrument_id)
+        mid_price_delta = mid_price - previous if previous is not None else 0.0
+        previous_mid_price[instrument_id] = mid_price
 
-            s = state[instr_id]
+        history = tick_history[instrument_id]
+        history.append(
+            [
+                imbalance,
+                spread,
+                observation.bid_quantity,
+                observation.ask_quantity,
+                mid_price_delta,
+            ]
+        )
+        if len(history) == window:
+            sequences.append(
+                {
+                    "instrument_id": instrument_id,
+                    "sequence": list(history),
+                    "mid_price": mid_price,
+                }
+            )
 
-            if action == "T":
-                continue
-
-            if action in ("A", "M"):
-                price = int(event["price"])
-                size = event["size"]
-                side = event["side"]
-                if side == "B":
-                    s["best_bid"] = price
-                    s["bid_qty"] = size
-                elif side == "A":
-                    s["best_ask"] = price
-                    s["ask_qty"] = size
-            else:
-                continue
-
-            if s["best_bid"] is None or s["best_ask"] is None:
-                continue
-
-            bid_qty, ask_qty = s["bid_qty"], s["ask_qty"]
-            total = bid_qty + ask_qty
-            if total == 0:
-                continue
-
-            imbalance = (bid_qty - ask_qty) / total
-            spread = s["best_ask"] - s["best_bid"]
-            mid_price = (s["best_bid"] + s["best_ask"]) / 2
-
-            prev_mp = mid_price_prev[instr_id]
-            mid_price_delta = (mid_price - prev_mp) if prev_mp is not None else 0.0
-            mid_price_prev[instr_id] = mid_price
-
-            raw_feat = [imbalance, spread, bid_qty, ask_qty, mid_price_delta]
-            hist = tick_history[instr_id]
-            hist.append(raw_feat)
-            if len(hist) > window + horizon + 5:
-                hist.pop(0)
-
-            if len(hist) >= window:
-                seq = hist[-window:]
-                sequences.append({"instrument_id": instr_id, "seq": seq, "mid_price": mid_price})
-
-    by_instrument = {}
-    for i, s in enumerate(sequences):
-        by_instrument.setdefault(s["instrument_id"], []).append(i)
+    by_instrument = defaultdict(list)
+    for index, sequence in enumerate(sequences):
+        by_instrument[sequence["instrument_id"]].append(index)
 
     labels = [None] * len(sequences)
-    for instr_id, idxs in by_instrument.items():
-        prices = [sequences[i]["mid_price"] for i in idxs]
-        for pos in range(len(idxs) - horizon):
-            future_price = prices[pos + horizon]
-            current_price = prices[pos]
-            labels[idxs[pos]] = 1 if future_price > current_price else 0
+    for indices in by_instrument.values():
+        for position in range(len(indices) - horizon):
+            current_index = indices[position]
+            future_index = indices[position + horizon]
+            labels[current_index] = int(
+                sequences[future_index]["mid_price"]
+                > sequences[current_index]["mid_price"]
+            )
 
-    X_list, y_list = [], []
-    for s, label in zip(sequences, labels):
-        if label is None:
-            continue
-        X_list.append(s["seq"])
-        y_list.append(label)
-
-    X = np.array(X_list, dtype=np.float32)
-    y = np.array(y_list, dtype=np.int64)
-    return X, y
+    features = [
+        sequence["sequence"]
+        for sequence, label in zip(sequences, labels, strict=True)
+        if label is not None
+    ]
+    targets = [label for label in labels if label is not None]
+    return (
+        np.asarray(features, dtype=np.float32),
+        np.asarray(targets, dtype=np.int64),
+    )

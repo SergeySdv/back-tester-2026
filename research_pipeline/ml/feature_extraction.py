@@ -1,127 +1,113 @@
-"""Реплеит JSONL напрямую (без C++ движка) и считает расширенный набор фичей+метку для обучения ML."""
-import json
+"""Extract deterministic top-of-book features and forward labels."""
+
+from __future__ import annotations
+
+from collections import defaultdict, deque
+
+from research_pipeline.l3_replay import iter_book_observations
 
 
-def replay_and_extract_features(path, horizon=20, imbalance_windows=(5, 20),
-                                 momentum_windows=(5, 20), volatility_window=20,
-                                 trade_freq_window=20):
-    """
-    Фичи: imbalance, spread, imbalance_ma_5, imbalance_ma_20,
-          momentum_5, momentum_20, volatility_20, bid_qty, ask_qty,
-          trade_freq_20 (доля "book update" моментов из последних N, после которых была сделка).
-    Строка (наблюдение) создаётся только на A/M событиях — так же, как on_book_update в движке,
-    T-события не создают отдельную строку, а лишь увеличивают счётчик trades_since_last_row.
-    """
-    state = {}
-    imbalance_history = {}
-    mid_price_history = {}
-    trade_flag_history = {}   # per-instrument deque из 0/1: была ли сделка с прошлой строки
-    trades_since_last_row = {}
+def extract_feature_rows(
+    path,
+    imbalance_windows=(5, 20),
+    momentum_windows=(5, 20),
+    volatility_window=20,
+    trade_freq_window=20,
+):
+    """Replay L3 JSONL and return one row per top-of-book callback."""
 
+    imbalance_history = defaultdict(lambda: deque(maxlen=max(imbalance_windows) + 1))
+    mid_price_history = defaultdict(
+        lambda: deque(maxlen=max(max(momentum_windows), volatility_window) + 1)
+    )
+    trade_flag_history = defaultdict(lambda: deque(maxlen=trade_freq_window))
     rows = []
 
-    with open(path) as f:
-        for line in f:
-            event = json.loads(line)
-            instr_id = event["hd"]["instrument_id"]
-            action = event["action"]
+    for observation in iter_book_observations(path):
+        instrument_id = observation.instrument_id
+        bid_quantity = observation.bid_quantity
+        ask_quantity = observation.ask_quantity
+        total = bid_quantity + ask_quantity
+        if total == 0:
+            continue
 
-            if instr_id not in state:
-                state[instr_id] = {"best_bid": None, "best_ask": None, "bid_qty": 0, "ask_qty": 0}
-                imbalance_history[instr_id] = []
-                mid_price_history[instr_id] = []
-                trade_flag_history[instr_id] = []
-                trades_since_last_row[instr_id] = 0
+        imbalance = (bid_quantity - ask_quantity) / total
+        spread = observation.best_ask - observation.best_bid
+        mid_price = (observation.best_bid + observation.best_ask) / 2
 
-            s = state[instr_id]
+        imbalance_values = imbalance_history[instrument_id]
+        imbalance_values.append(imbalance)
+        mid_prices = mid_price_history[instrument_id]
+        mid_prices.append(mid_price)
+        trade_flags = trade_flag_history[instrument_id]
+        trade_flags.append(1 if observation.trades_since_previous > 0 else 0)
 
-            if action == "T":
-                trades_since_last_row[instr_id] += 1
-                continue  # T не создаёт строку, только считается — как on_trade в движке
+        row = {
+            "instrument_id": instrument_id,
+            "imbalance": imbalance,
+            "spread": spread,
+            "mid_price": mid_price,
+            "bid_qty": bid_quantity,
+            "ask_qty": ask_quantity,
+        }
+        for window in imbalance_windows:
+            values = list(imbalance_values)[-window:]
+            row[f"imbalance_ma_{window}"] = sum(values) / len(values)
 
-            if action in ("A", "M"):
-                price = int(event["price"])
-                size = event["size"]
-                side = event["side"]
-                if side == "B":
-                    s["best_bid"] = price
-                    s["bid_qty"] = size
-                elif side == "A":
-                    s["best_ask"] = price
-                    s["ask_qty"] = size
-            else:
-                continue  # C/F/R пока не обрабатываем как отдельную строку
+        for window in momentum_windows:
+            row[f"momentum_{window}"] = (
+                mid_prices[-1] - mid_prices[-window - 1]
+                if len(mid_prices) > window
+                else 0.0
+            )
 
-            if s["best_bid"] is None or s["best_ask"] is None:
-                continue
+        volatility_values = list(mid_prices)[-volatility_window:]
+        if len(volatility_values) >= 2:
+            mean = sum(volatility_values) / len(volatility_values)
+            variance = sum((value - mean) ** 2 for value in volatility_values) / len(
+                volatility_values
+            )
+            row[f"volatility_{volatility_window}"] = variance**0.5
+        else:
+            row[f"volatility_{volatility_window}"] = 0.0
 
-            bid_qty, ask_qty = s["bid_qty"], s["ask_qty"]
-            total = bid_qty + ask_qty
-            if total == 0:
-                continue
+        row[f"trade_freq_{trade_freq_window}"] = sum(trade_flags) / len(trade_flags)
+        rows.append(row)
 
-            imbalance = (bid_qty - ask_qty) / total
-            spread = s["best_ask"] - s["best_bid"]
-            mid_price = (s["best_bid"] + s["best_ask"]) / 2
+    return rows
 
-            hist = imbalance_history[instr_id]
-            hist.append(imbalance)
-            if len(hist) > max(imbalance_windows) + 1:
-                hist.pop(0)
 
-            mp_hist = mid_price_history[instr_id]
-            mp_hist.append(mid_price)
-            if len(mp_hist) > max(max(momentum_windows), volatility_window) + 1:
-                mp_hist.pop(0)
+def replay_and_extract_features(
+    path,
+    horizon=20,
+    imbalance_windows=(5, 20),
+    momentum_windows=(5, 20),
+    volatility_window=20,
+    trade_freq_window=20,
+):
+    rows = extract_feature_rows(
+        path,
+        imbalance_windows=imbalance_windows,
+        momentum_windows=momentum_windows,
+        volatility_window=volatility_window,
+        trade_freq_window=trade_freq_window,
+    )
 
-            tf_hist = trade_flag_history[instr_id]
-            tf_hist.append(1 if trades_since_last_row[instr_id] > 0 else 0)
-            if len(tf_hist) > trade_freq_window:
-                tf_hist.pop(0)
-            trades_since_last_row[instr_id] = 0
-
-            feats = {"instrument_id": instr_id, "imbalance": imbalance,
-                     "spread": spread, "mid_price": mid_price,
-                     "bid_qty": bid_qty, "ask_qty": ask_qty}
-            for w in imbalance_windows:
-                window_vals = hist[-w:] if len(hist) >= w else hist
-                feats[f"imbalance_ma_{w}"] = sum(window_vals) / len(window_vals) if window_vals else 0.0
-
-            for mw in momentum_windows:
-                if len(mp_hist) > mw:
-                    feats[f"momentum_{mw}"] = mp_hist[-1] - mp_hist[-mw - 1]
-                else:
-                    feats[f"momentum_{mw}"] = 0.0
-
-            if len(mp_hist) >= 2:
-                window_vals = mp_hist[-volatility_window:] if len(mp_hist) >= volatility_window else mp_hist
-                mean_v = sum(window_vals) / len(window_vals)
-                var_v = sum((v - mean_v) ** 2 for v in window_vals) / len(window_vals)
-                feats[f"volatility_{volatility_window}"] = var_v ** 0.5
-            else:
-                feats[f"volatility_{volatility_window}"] = 0.0
-
-            feats[f"trade_freq_{trade_freq_window}"] = sum(tf_hist) / len(tf_hist) if tf_hist else 0.0
-
-            rows.append(feats)
-
-    by_instrument_indices = {}
-    for i, r in enumerate(rows):
-        by_instrument_indices.setdefault(r["instrument_id"], []).append(i)
+    by_instrument_indices = defaultdict(list)
+    for index, row in enumerate(rows):
+        by_instrument_indices[row["instrument_id"]].append(index)
 
     labels = [None] * len(rows)
-    for instr_id, idxs in by_instrument_indices.items():
-        prices = [rows[i]["mid_price"] for i in idxs]
-        for pos in range(len(idxs) - horizon):
-            future_price = prices[pos + horizon]
-            current_price = prices[pos]
-            labels[idxs[pos]] = 1 if future_price > current_price else 0
+    for indices in by_instrument_indices.values():
+        for position in range(len(indices) - horizon):
+            current_index = indices[position]
+            future_index = indices[position + horizon]
+            labels[current_index] = int(
+                rows[future_index]["mid_price"] > rows[current_index]["mid_price"]
+            )
 
-    dataset = []
-    for r, label in zip(rows, labels):
-        if label is None:
-            continue
-        r["label"] = label
-        dataset.append(r)
-
-    return dataset
+    return [
+        {**row, "label": label}
+        for row, label in zip(rows, labels, strict=True)
+        if label is not None
+    ]

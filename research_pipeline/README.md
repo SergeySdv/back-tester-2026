@@ -20,13 +20,15 @@ signal -> C++ engine -> comparison of rule-based / ML / DL strategies -> statist
 - `train_mlp.py` / `validate_mlp.py` — MLP (PyTorch).
 - `tcn_windows/` — TCN is trained separately via native Windows Python on GPU
   (WSL1 does not support CUDA passthrough).
-- Validation: train/val/test split with embargo, walk-forward (5 folds), permutation test.
-  All models are statistically significant (p=0.0000).
+- Validation uses a train/validation/test split with an embargo. Evaluation
+  scripts report fixed-model results across five chronological folds and a
+  permutation test; they do not retrain within each fold.
 
 ## Strategy comparison
 
-- `run_comparison.py --strategies all -d <file>` — runs all strategies through the C++
-  engine; metrics: PnL, Sharpe, Max Drawdown, Profit Factor, Win Rate.
+- `run_comparison.py --strategies all -d <file>` — runs every strategy whose
+  dependencies and model artifacts are present through the C++ engine; metrics:
+  PnL, Sharpe, Max Drawdown, Profit Factor, Win Rate.
 - `grid_search.py <strategy>` — sweeps execution parameters (confirmation_steps, min_hold_updates).
 
 ## Key finding

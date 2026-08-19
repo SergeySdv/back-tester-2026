@@ -1,20 +1,21 @@
 """Обучение LSTM (PyTorch) на окнах последовательностей — та же архитектура
 входа (window=20, 5 raw-фичей), что и у TCN, для честного сравнения.
 Запуск (WSL, CPU): uv run python3 train_lstm.py"""
-import sys
-import os
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import json
 import time
+from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
-from feature_extraction_lstm import replay_and_extract_sequences
+from strategies.neural.models import LSTM
 
-DATA_PATH = "../../synthetic_signal_slow_train.jsonl"  # используем тот же train-сегмент, что и DQN v3
-MODEL_PATH = "lstm_model.pt"
-SCALER_PATH = "lstm_scaler.json"
+from .feature_extraction_lstm import replay_and_extract_sequences
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+DATA_PATH = REPO_ROOT / "synthetic_signal_slow_train.jsonl"
+MODEL_PATH = REPO_ROOT / "research_pipeline/ml/lstm_model.pt"
+SCALER_PATH = REPO_ROOT / "research_pipeline/ml/lstm_scaler.json"
 
 WINDOW = 20
 HORIZON = 20
@@ -37,26 +38,14 @@ def split_with_embargo(n, train_frac, val_frac, embargo):
     return train_idx, val_idx, test_idx
 
 
-class LSTM(nn.Module):
-    def __init__(self, n_features, hidden_size=32, num_layers=1):
-        super().__init__()
-        self.lstm = nn.LSTM(n_features, hidden_size, num_layers, batch_first=True)
-        self.head = nn.Linear(hidden_size, 1)
-
-    def forward(self, x):
-        out, (h_n, c_n) = self.lstm(x)
-        last = out[:, -1, :]
-        return self.head(last).squeeze(-1)
-
-
 def evaluate(model, X, y, mean, std, device, batch_size=8192):
     model.eval()
     correct = 0
     with torch.no_grad():
         for i in range(0, len(X), batch_size):
-            xb = (X[i:i+batch_size] - mean) / std
+            xb = (X[i : i + batch_size] - mean) / std
             xb = torch.tensor(xb, dtype=torch.float32, device=device)
-            yb = y[i:i+batch_size]
+            yb = y[i : i + batch_size]
             pred = (torch.sigmoid(model(xb)) > 0.5).cpu().numpy().astype(int)
             correct += (pred == yb).sum()
     return correct / len(X)
@@ -68,10 +57,12 @@ def main():
     print("Извлечение окон последовательностей из", DATA_PATH, "...")
     t0 = time.time()
     X, y = replay_and_extract_sequences(DATA_PATH, horizon=HORIZON, window=WINDOW)
-    print(f"Готово за {time.time()-t0:.1f}s. X.shape={X.shape}, y.shape={y.shape}")
+    print(f"Готово за {time.time() - t0:.1f}s. X.shape={X.shape}, y.shape={y.shape}")
 
     n = len(X)
-    train_idx, val_idx, test_idx = split_with_embargo(n, TRAIN_FRAC, VAL_FRAC, EMBARGO_ROWS)
+    train_idx, val_idx, test_idx = split_with_embargo(
+        n, TRAIN_FRAC, VAL_FRAC, EMBARGO_ROWS
+    )
     print(f"train={len(train_idx)}  val={len(val_idx)}  test={len(test_idx)}")
 
     X_train, y_train = X[train_idx], y[train_idx]
@@ -94,7 +85,7 @@ def main():
         total_loss = 0.0
         t_epoch = time.time()
         for i in range(0, n_train, BATCH_SIZE):
-            idx = perm[i:i+BATCH_SIZE]
+            idx = perm[i : i + BATCH_SIZE]
             xb = (X_train[idx] - mean) / std
             xb = torch.tensor(xb, dtype=torch.float32, device=device)
             yb = torch.tensor(y_train[idx], dtype=torch.float32, device=device)
@@ -108,7 +99,9 @@ def main():
 
         avg_loss = total_loss / n_train
         val_acc = evaluate(model, X_val, y_val, mean, std, device)
-        print(f"  Epoch {epoch+1}/{EPOCHS}: loss={avg_loss:.4f} val_acc={val_acc:.4f} ({time.time()-t_epoch:.1f}s)")
+        print(
+            f"  Epoch {epoch + 1}/{EPOCHS}: loss={avg_loss:.4f} val_acc={val_acc:.4f} ({time.time() - t_epoch:.1f}s)"
+        )
 
     train_acc = evaluate(model, X_train, y_train, mean, std, device)
     val_acc = evaluate(model, X_val, y_val, mean, std, device)
@@ -121,8 +114,18 @@ def main():
 
     torch.save(model.state_dict(), MODEL_PATH)
     with open(SCALER_PATH, "w") as f:
-        json.dump({"mean": mean.tolist(), "std": std.tolist(), "window": WINDOW,
-                    "train_acc": train_acc, "val_acc": val_acc, "test_acc": test_acc}, f, indent=2)
+        json.dump(
+            {
+                "mean": mean.tolist(),
+                "std": std.tolist(),
+                "window": WINDOW,
+                "train_acc": train_acc,
+                "val_acc": val_acc,
+                "test_acc": test_acc,
+            },
+            f,
+            indent=2,
+        )
 
     print(f"\nМодель сохранена в {MODEL_PATH}")
     print(f"Scaler сохранён в {SCALER_PATH}")

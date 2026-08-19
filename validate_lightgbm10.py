@@ -5,18 +5,17 @@
 LightGBMStrategy/run_comparison.py.
 
 Та же методология, что validate_ensemble.py: honest test-сегмент,
-confirmation_steps/min_hold_updates фильтр, walk-forward + permutation test.
+confirmation_steps/min_hold_updates фильтр, chronological fold evaluation + permutation test.
 
 Запуск:
     uv run python3 validate_lightgbm10.py --data synthetic_signal_slow_test.jsonl
 """
+
 from __future__ import annotations
 
 import argparse
-import json
 import random
 import sys
-from collections import deque
 
 import numpy as np
 import lightgbm as lgb
@@ -25,17 +24,33 @@ sys.path.insert(0, "research_pipeline/ml")
 from feature_extraction import replay_and_extract_features  # noqa: E402
 
 TRANSACTION_COST = 0.5
-N_WALKFORWARD_FOLDS = 5
+N_CHRONOLOGICAL_FOLDS = 5
 N_PERMUTATIONS = 100
 MODEL_DIR = "research_pipeline/ml"
 CONFIRMATION_STEPS = 3
 MIN_HOLD_UPDATES = 15
 
-LOGREG_FEATURES_10 = ["imbalance", "spread", "imbalance_ma_5", "imbalance_ma_20",
-                       "momentum_5", "momentum_20", "volatility_20", "bid_qty",
-                       "ask_qty", "trade_freq_20"]
-LGB_FEATURES_7 = ["imbalance", "spread", "imbalance_ma_5", "imbalance_ma_20",
-                   "momentum_5", "bid_qty", "ask_qty"]
+LOGREG_FEATURES_10 = [
+    "imbalance",
+    "spread",
+    "imbalance_ma_5",
+    "imbalance_ma_20",
+    "momentum_5",
+    "momentum_20",
+    "volatility_20",
+    "bid_qty",
+    "ask_qty",
+    "trade_freq_20",
+]
+LGB_FEATURES_7 = [
+    "imbalance",
+    "spread",
+    "imbalance_ma_5",
+    "imbalance_ma_20",
+    "momentum_5",
+    "bid_qty",
+    "ask_qty",
+]
 
 DECISION_TO_POSITION = {"LONG": 1, "SHORT": -1, "FLAT": 0}
 POSITION_TO_DECISION = {1: "LONG", -1: "SHORT", 0: "FLAT"}
@@ -61,8 +76,9 @@ def get_decisions(model, features, dataset, prob_threshold=0.52):
     return decisions, mid_prices
 
 
-def apply_confirmation_and_hold(decisions, confirmation_steps=CONFIRMATION_STEPS,
-                                 min_hold_updates=MIN_HOLD_UPDATES):
+def apply_confirmation_and_hold(
+    decisions, confirmation_steps=CONFIRMATION_STEPS, min_hold_updates=MIN_HOLD_UPDATES
+):
     filtered = []
     position = 0
     pending_target = None
@@ -112,15 +128,24 @@ def compute_metrics_from_pnls(pnls):
         return {"sharpe": 0.0, "win_rate": 0.0, "total_pnl": 0.0, "profit_factor": 0.0}
     total_pnl = sum(pnls)
     mean_pnl = total_pnl / len(pnls)
-    variance = sum((p - mean_pnl) ** 2 for p in pnls) / len(pnls) if len(pnls) > 1 else 0.0
-    std_pnl = variance ** 0.5
+    variance = (
+        sum((p - mean_pnl) ** 2 for p in pnls) / len(pnls) if len(pnls) > 1 else 0.0
+    )
+    std_pnl = variance**0.5
     sharpe = (mean_pnl / std_pnl) if std_pnl > 0 else 0.0
     nonzero = [p for p in pnls if p != 0]
     win_rate = (sum(1 for p in nonzero if p > 0) / len(nonzero)) if nonzero else 0.0
     gains = sum(p for p in pnls if p > 0)
     losses = -sum(p for p in pnls if p < 0)
-    profit_factor = (gains / losses) if losses > 0 else (float("inf") if gains > 0 else 0.0)
-    return {"sharpe": sharpe, "win_rate": win_rate, "total_pnl": total_pnl, "profit_factor": profit_factor}
+    profit_factor = (
+        (gains / losses) if losses > 0 else (float("inf") if gains > 0 else 0.0)
+    )
+    return {
+        "sharpe": sharpe,
+        "win_rate": win_rate,
+        "total_pnl": total_pnl,
+        "profit_factor": profit_factor,
+    }
 
 
 def segments_from_decisions(decisions):
@@ -140,7 +165,9 @@ def segments_from_decisions(decisions):
 
 def permutation_test(decisions, mid_prices, n_permutations=N_PERMUTATIONS, seed=42):
     segments = segments_from_decisions(decisions)
-    n_transitions = sum(1 for i in range(1, len(segments)) if segments[i][2] != segments[i-1][2])
+    n_transitions = sum(
+        1 for i in range(1, len(segments)) if segments[i][2] != segments[i - 1][2]
+    )
     fixed_cost = n_transitions * TRANSACTION_COST
 
     def market_pnl(segs):
@@ -169,45 +196,65 @@ def permutation_test(decisions, mid_prices, n_permutations=N_PERMUTATIONS, seed=
     n_extreme = sum(1 for t in random_totals if abs(t) >= abs(real_total))
     p_value = n_extreme / n_permutations
     random_mean = sum(random_totals) / len(random_totals)
-    return {"real_total": real_total, "random_mean": random_mean, "p_value": p_value,
-            "n_transitions": n_transitions}
+    return {
+        "real_total": real_total,
+        "random_mean": random_mean,
+        "p_value": p_value,
+        "n_transitions": n_transitions,
+    }
 
 
 def run_full_validation(name, model, features, dataset, n):
-    print(f"\n{'='*60}\n{name}\n{'='*60}")
+    print(f"\n{'=' * 60}\n{name}\n{'=' * 60}")
     raw_decisions, mid_prices = get_decisions(model, features, dataset)
     decisions = apply_confirmation_and_hold(raw_decisions)
-    n_raw = sum(1 for i in range(1, len(raw_decisions)) if raw_decisions[i] != raw_decisions[i-1])
-    n_filt = sum(1 for i in range(1, len(decisions)) if decisions[i] != decisions[i-1])
+    n_raw = sum(
+        1
+        for i in range(1, len(raw_decisions))
+        if raw_decisions[i] != raw_decisions[i - 1]
+    )
+    n_filt = sum(
+        1 for i in range(1, len(decisions)) if decisions[i] != decisions[i - 1]
+    )
     print(f"Смен решения: сырых={n_raw} -> после фильтра={n_filt}")
 
     full_pnls = compute_pnl(decisions, mid_prices, 0, n)
     m = compute_metrics_from_pnls(full_pnls)
-    print(f"total_pnl={m['total_pnl']:.2f}  sharpe={m['sharpe']:.4f}  "
-          f"profit_factor={m['profit_factor']:.3f}  win_rate={m['win_rate']:.1%}")
+    print(
+        f"total_pnl={m['total_pnl']:.2f}  sharpe={m['sharpe']:.4f}  "
+        f"profit_factor={m['profit_factor']:.3f}  win_rate={m['win_rate']:.1%}"
+    )
 
-    fold_size = n // N_WALKFORWARD_FOLDS
+    fold_size = n // N_CHRONOLOGICAL_FOLDS
     fold_sharpes = []
-    for fold in range(N_WALKFORWARD_FOLDS):
+    for fold in range(N_CHRONOLOGICAL_FOLDS):
         start = fold * fold_size
-        end = n if fold == N_WALKFORWARD_FOLDS - 1 else (fold + 1) * fold_size
+        end = n if fold == N_CHRONOLOGICAL_FOLDS - 1 else (fold + 1) * fold_size
         pnls = compute_pnl(decisions, mid_prices, start, end)
         fm = compute_metrics_from_pnls(pnls)
         fold_sharpes.append(fm["sharpe"])
         print(f"  Fold {fold}: sharpe={fm['sharpe']:.4f} win_rate={fm['win_rate']:.1%}")
     positive_folds = sum(1 for s in fold_sharpes if s > 0)
-    print(f"Положительных фолдов: {positive_folds}/{N_WALKFORWARD_FOLDS}")
+    print(f"Положительных фолдов: {positive_folds}/{N_CHRONOLOGICAL_FOLDS}")
 
     pt = permutation_test(decisions, mid_prices)
-    print(f"Permutation test: real={pt['real_total']:.2f} random_mean={pt['random_mean']:.2f} "
-          f"p={pt['p_value']:.4f}")
+    print(
+        f"Permutation test: real={pt['real_total']:.2f} random_mean={pt['random_mean']:.2f} "
+        f"p={pt['p_value']:.4f}"
+    )
     if pt["p_value"] < 0.05:
         print(f"=> ЗНАЧИМ (p={pt['p_value']:.4f})")
     else:
         print(f"=> НЕ подтверждён (p={pt['p_value']:.4f})")
 
-    return {"name": name, "sharpe": m["sharpe"], "profit_factor": m["profit_factor"],
-            "win_rate": m["win_rate"], "p_value": pt["p_value"], "positive_folds": positive_folds}
+    return {
+        "name": name,
+        "sharpe": m["sharpe"],
+        "profit_factor": m["profit_factor"],
+        "win_rate": m["win_rate"],
+        "p_value": pt["p_value"],
+        "positive_folds": positive_folds,
+    }
 
 
 def main():
@@ -229,24 +276,36 @@ def main():
     print(f"OK: num_feature={model_7.num_feature()}")
 
     if model_10.num_feature() != len(LOGREG_FEATURES_10):
-        print(f"ВНИМАНИЕ: num_feature старой модели ({model_10.num_feature()}) "
-              f"не совпадает с ожидаемыми 10 фичами LogReg-набора. "
-              f"Порядок фичей может отличаться — результат может быть некорректным.")
+        print(
+            f"ВНИМАНИЕ: num_feature старой модели ({model_10.num_feature()}) "
+            f"не совпадает с ожидаемыми 10 фичами LogReg-набора. "
+            f"Порядок фичей может отличаться — результат может быть некорректным."
+        )
 
     print(f"\nДанные: {args.data} — извлечение фичей...")
-    dataset_all = replay_and_extract_features(args.data, horizon=20, imbalance_windows=(5, 20))
+    dataset_all = replay_and_extract_features(
+        args.data, horizon=20, imbalance_windows=(5, 20)
+    )
     dataset = [row for row in dataset_all if row["instrument_id"] == args.instrument_id]
     n = len(dataset)
     print(f"Наблюдений (instrument_id={args.instrument_id}): {n}")
 
-    r10 = run_full_validation("LightGBM (10 фичей, старая модель)", model_10, LOGREG_FEATURES_10, dataset, n)
-    r7 = run_full_validation("LightGBM (7 фичей, актуальная модель)", model_7, LGB_FEATURES_7, dataset, n)
+    r10 = run_full_validation(
+        "LightGBM (10 фичей, старая модель)", model_10, LOGREG_FEATURES_10, dataset, n
+    )
+    r7 = run_full_validation(
+        "LightGBM (7 фичей, актуальная модель)", model_7, LGB_FEATURES_7, dataset, n
+    )
 
-    print(f"\n{'='*60}\nСРАВНЕНИЕ\n{'='*60}")
-    print(f"{'Модель':<35} {'Sharpe':>8} {'PF':>8} {'WinRate':>9} {'p-value':>9} {'Фолды':>7}")
+    print(f"\n{'=' * 60}\nСРАВНЕНИЕ\n{'=' * 60}")
+    print(
+        f"{'Модель':<35} {'Sharpe':>8} {'PF':>8} {'WinRate':>9} {'p-value':>9} {'Фолды':>7}"
+    )
     for r in [r10, r7]:
-        print(f"{r['name']:<35} {r['sharpe']:>8.4f} {r['profit_factor']:>8.3f} "
-              f"{r['win_rate']:>8.1%} {r['p_value']:>9.4f} {r['positive_folds']}/5")
+        print(
+            f"{r['name']:<35} {r['sharpe']:>8.4f} {r['profit_factor']:>8.3f} "
+            f"{r['win_rate']:>8.1%} {r['p_value']:>9.4f} {r['positive_folds']}/5"
+        )
 
 
 if __name__ == "__main__":
